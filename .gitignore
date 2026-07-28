@@ -5,3 +5,9 @@ Win/Bin/gb28181device-1.log
 Android/qr/build/
 Android/.idea/
 *.log
+.DS_Store
+Mac/.DS_Store
+Mac/build/
+Mac/dist/
+Mac/__pycache__/
+Mac/core/__pycache__/
