@@ -11,3 +11,8 @@ Mac/build/
 Mac/dist/
 Mac/__pycache__/
 Mac/core/__pycache__/
+
+.DS_Store
+*.dmg
+*.apk
+node_modules/
