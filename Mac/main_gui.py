@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QGroupBox, QSizePolicy, QCheckBox, QSplitter, QListView,
                              QGraphicsView, QGraphicsScene, QGridLayout, QDialog,
                              QDialogButtonBox, QFileDialog, QSlider, QMessageBox,
-                             QInputDialog)
+                             QInputDialog, QTabWidget, QTableWidget, QTableWidgetItem,
+                             QHeaderView, QSpinBox, QAbstractItemView)
 from PySide6.QtCore import (
     QCameraPermission, Qt, QThread, QTimer, Signal, QObject, QUrl, QSizeF
 )
@@ -259,12 +260,22 @@ class DeviceThread(QThread):
     media_state_changed = Signal(str, str)
     media_preview_changed = Signal(str)
 
-    def __init__(self, config_data):
+    def __init__(self, config_data, log_prefix="", log_callback=None):
         super().__init__()
         self.config_data = config_data
+        self.log_prefix = log_prefix
+        self.custom_log_callback = log_callback
         self.device = None
         self.last_registration_state = "IDLE"
         self.last_registration_message = ""
+
+    def _log(self, msg):
+        prefix = f"[{self.log_prefix}] " if self.log_prefix else ""
+        formatted = f"{prefix}{msg}"
+        if self.custom_log_callback:
+            self.custom_log_callback(formatted)
+        else:
+            log_signaler.log_signal.emit(formatted)
 
     def _on_registration_state(self, state, message):
         self.last_registration_state = state
@@ -276,7 +287,7 @@ class DeviceThread(QThread):
             config_obj = ConfigMock(self.config_data)
             self.device = GB28181Device(
                 config_obj,
-                log_callback=log_signaler.log_signal.emit,
+                log_callback=self._log,
                 state_callback=self._on_registration_state,
                 ptz_callback=self.ptz_state_changed.emit,
                 media_state_callback=self.media_state_changed.emit,
@@ -284,7 +295,7 @@ class DeviceThread(QThread):
             )
             self.device.start()
         except Exception as e:
-            log_signaler.log_signal.emit(f"[错误] 设备线程崩溃: {e}")
+            self._log(f"[错误] 设备线程崩溃: {e}")
 
     def stop(self):
         if self.device:
@@ -619,6 +630,8 @@ class EasyGBDMacGUI(QMainWindow):
         self.channel_configs = []
         self.current_channel_index = 0
         self._loading_channel_ui = False
+        self.multi_devices = []
+        self.multi_device_counter = 0
         self.init_ui()
 
     def init_ui(self):
@@ -712,6 +725,62 @@ class EasyGBDMacGUI(QMainWindow):
                 background-color: #18181B;
                 border: 1px solid #27272A;
                 border-radius: 8px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #27272A;
+                background-color: #09090B;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QTabBar::tab {
+                background-color: #18181B;
+                color: #A1A1AA;
+                border: 1px solid #27272A;
+                border-bottom: none;
+                padding: 8px 18px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                font-size: 13px;
+                font-weight: 600;
+                margin-right: 4px;
+            }
+            QTabBar::tab:hover {
+                background-color: #27272A;
+                color: #FAFAFA;
+            }
+            QTabBar::tab:selected {
+                background-color: #4F46E5;
+                color: #FFFFFF;
+                border-color: #6366F1;
+            }
+            QTableWidget {
+                background-color: #18181B;
+                alternate-background-color: #111113;
+                color: #FAFAFA;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+                gridline-color: #27272A;
+                selection-background-color: #312E81;
+                selection-color: #FFFFFF;
+            }
+            QHeaderView::section {
+                background-color: #27272A;
+                color: #D4D4D8;
+                padding: 6px;
+                border: 1px solid #3F3F46;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QSpinBox {
+                background-color: #18181B;
+                color: #FAFAFA;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+                padding: 5px;
+                font-size: 13px;
+            }
+            QSpinBox:focus {
+                border: 1px solid #6366F1;
             }
         """)
 
@@ -1315,10 +1384,16 @@ class EasyGBDMacGUI(QMainWindow):
         self.log_text.setMinimumHeight(150)
         log_panel_layout.addWidget(self.log_text)
 
-        # 把上部和下部放入主垂直分割器
-        main_splitter.addWidget(top_splitter)
+        # 创建主选项卡容器 (单设备精细调试 vs 多设备模拟集群)
+        self.main_tab_widget = QTabWidget()
+        self.main_tab_widget.addTab(top_splitter, "📱 单设备精细调试")
+        self.multi_device_widget = self.create_multi_device_tab()
+        self.main_tab_widget.addTab(self.multi_device_widget, "🚀 多设备模拟集群")
+
+        # 把主选项卡和底部日志面板放入主垂直分割器
+        main_splitter.addWidget(self.main_tab_widget)
         main_splitter.addWidget(log_panel)
-        main_splitter.setSizes([500, 250])
+        main_splitter.setSizes([550, 200])
 
         main_layout.addWidget(main_splitter, 1)
 
@@ -2432,10 +2507,551 @@ class EasyGBDMacGUI(QMainWindow):
         """)
         self.append_log("[系统] 手动测试推流已停止。")
 
+    # ──────────────────────── 多设备集群控制模块 ────────────────────────
+
+    def create_multi_device_tab(self):
+        tab_widget = QWidget()
+        tab_layout = QVBoxLayout(tab_widget)
+        tab_layout.setContentsMargins(8, 8, 8, 8)
+        tab_layout.setSpacing(10)
+
+        # ── 1. 顶部配置与批量生成卡片 ──
+        batch_frame = QFrame()
+        batch_frame.setObjectName("basic_frame")
+        batch_layout = QVBoxLayout(batch_frame)
+        batch_layout.setContentsMargins(12, 12, 12, 12)
+        batch_layout.setSpacing(10)
+
+        # 第一行：平台公共连接配置
+        platform_row = QHBoxLayout()
+        platform_row.setSpacing(8)
+
+        platform_row.addWidget(QLabel("平台 SIP IP:"))
+        server_ip_default = self.input_server_ip.currentText().strip() if hasattr(self, 'input_server_ip') else "192.168.1.38"
+        self.multi_input_server_ip = QLineEdit(server_ip_default or "192.168.1.38")
+        self.multi_input_server_ip.setFixedWidth(130)
+        platform_row.addWidget(self.multi_input_server_ip)
+
+        platform_row.addWidget(QLabel("端口:"))
+        server_port_default = self.input_server_port.text().strip() if hasattr(self, 'input_server_port') else "5060"
+        self.multi_input_server_port = QLineEdit(server_port_default or "5060")
+        self.multi_input_server_port.setFixedWidth(60)
+        platform_row.addWidget(self.multi_input_server_port)
+
+        platform_row.addWidget(QLabel("平台国标 ID:"))
+        server_id_default = self.input_server_id.text().strip() if hasattr(self, 'input_server_id') else "34020000002000000001"
+        self.multi_input_server_id = QLineEdit(server_id_default or "34020000002000000001")
+        self.multi_input_server_id.setFixedWidth(170)
+        platform_row.addWidget(self.multi_input_server_id)
+
+        platform_row.addWidget(QLabel("密码:"))
+        pwd_default = self.input_password.text().strip() if hasattr(self, 'input_password') else "12345"
+        self.multi_input_password = QLineEdit(pwd_default or "12345")
+        self.multi_input_password.setFixedWidth(90)
+        platform_row.addWidget(self.multi_input_password)
+
+        platform_row.addStretch()
+        batch_layout.addLayout(platform_row)
+
+        # 第二行：批量设备参数生成
+        gen_row = QHBoxLayout()
+        gen_row.setSpacing(8)
+
+        gen_row.addWidget(QLabel("起始端口:"))
+        self.multi_input_start_port = QSpinBox()
+        self.multi_input_start_port.setRange(1024, 65535)
+        self.multi_input_start_port.setValue(50601)
+        self.multi_input_start_port.setFixedWidth(85)
+        gen_row.addWidget(self.multi_input_start_port)
+
+        gen_row.addWidget(QLabel("起始设备 ID:"))
+        self.multi_input_start_device_id = QLineEdit("34020000001110000001")
+        self.multi_input_start_device_id.setFixedWidth(170)
+        gen_row.addWidget(self.multi_input_start_device_id)
+
+        gen_row.addWidget(QLabel("起始通道 ID:"))
+        self.multi_input_start_channel_id = QLineEdit("34020000001320000001")
+        self.multi_input_start_channel_id.setFixedWidth(170)
+        gen_row.addWidget(self.multi_input_start_channel_id)
+
+        gen_row.addWidget(QLabel("生成数量:"))
+        self.multi_input_count = QSpinBox()
+        self.multi_input_count.setRange(1, 100)
+        self.multi_input_count.setValue(5)
+        self.multi_input_count.setFixedWidth(65)
+        gen_row.addWidget(self.multi_input_count)
+
+        gen_row.addWidget(QLabel("推流源:"))
+        self.multi_combo_source = QComboBox()
+        self.multi_combo_source.addItems([
+            "【虚拟源】测试彩条信号 (推荐)",
+            "【自定义源】RTSP/MP4文件",
+            "【摄像头】本机默认摄像头"
+        ])
+        gen_row.addWidget(self.multi_combo_source)
+
+        gen_row.addStretch()
+        batch_layout.addLayout(gen_row)
+
+        # 第三行：操作按钮
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.btn_multi_batch_generate = QPushButton("➕ 批量生成并添加到列表")
+        self.btn_multi_batch_generate.setStyleSheet("""
+            QPushButton { background-color: #4F46E5; color: white; font-weight: bold; border-radius: 6px; padding: 7px 16px; font-size: 13px; }
+            QPushButton:hover { background-color: #6366F1; }
+        """)
+        self.btn_multi_batch_generate.clicked.connect(self.on_multi_batch_generate)
+        btn_row.addWidget(self.btn_multi_batch_generate)
+
+        self.btn_multi_add_single = QPushButton("➕ 添加单台")
+        self.btn_multi_add_single.setStyleSheet("""
+            QPushButton { background-color: #27272A; border: 1px solid #3F3F46; color: white; border-radius: 6px; padding: 7px 14px; font-size: 13px; }
+            QPushButton:hover { background-color: #3F3F46; }
+        """)
+        self.btn_multi_add_single.clicked.connect(self.on_multi_add_single)
+        btn_row.addWidget(self.btn_multi_add_single)
+
+        self.btn_multi_clear_all = QPushButton("🧹 清空列表")
+        self.btn_multi_clear_all.setStyleSheet("""
+            QPushButton { background-color: #27272A; border: 1px solid #3F3F46; color: #A1A1AA; border-radius: 6px; padding: 7px 14px; font-size: 13px; }
+            QPushButton:hover { background-color: #3F3F46; color: #FAFAFA; }
+        """)
+        self.btn_multi_clear_all.clicked.connect(self.on_multi_clear_all)
+        btn_row.addWidget(self.btn_multi_clear_all)
+
+        btn_row.addStretch()
+
+        # 集群全局启动/停止按钮
+        self.btn_multi_start_all = QPushButton("🚀 一键启动全部设备")
+        self.btn_multi_start_all.setStyleSheet("""
+            QPushButton { background-color: #059669; color: white; font-weight: bold; border-radius: 6px; padding: 7px 18px; font-size: 13px; }
+            QPushButton:hover { background-color: #10B981; }
+        """)
+        self.btn_multi_start_all.clicked.connect(self.on_multi_start_all)
+        btn_row.addWidget(self.btn_multi_start_all)
+
+        self.btn_multi_stop_all = QPushButton("🛑 一键停止全部设备")
+        self.btn_multi_stop_all.setStyleSheet("""
+            QPushButton { background-color: #DC2626; color: white; font-weight: bold; border-radius: 6px; padding: 7px 18px; font-size: 13px; }
+            QPushButton:hover { background-color: #EF4444; }
+        """)
+        self.btn_multi_stop_all.clicked.connect(self.on_multi_stop_all)
+        btn_row.addWidget(self.btn_multi_stop_all)
+
+        batch_layout.addLayout(btn_row)
+        tab_layout.addWidget(batch_frame)
+
+        # ── 2. 集群状态指标与统计栏 ──
+        kpi_frame = QFrame()
+        kpi_frame.setStyleSheet("""
+            QFrame {
+                background-color: #18181B;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+                padding: 4px 12px;
+            }
+            QLabel { font-size: 13px; font-weight: bold; }
+        """)
+        kpi_layout = QHBoxLayout(kpi_frame)
+        kpi_layout.setContentsMargins(8, 6, 8, 6)
+        
+        self.lbl_multi_kpi_total = QLabel("总设备: 0 台")
+        self.lbl_multi_kpi_total.setStyleSheet("color: #E4E4E7;")
+        
+        self.lbl_multi_kpi_online = QLabel("● 在线注册: 0 台")
+        self.lbl_multi_kpi_online.setStyleSheet("color: #10B981;")
+
+        self.lbl_multi_kpi_streaming = QLabel("● 正在推流: 0 台")
+        self.lbl_multi_kpi_streaming.setStyleSheet("color: #38BDF8;")
+
+        self.lbl_multi_kpi_idle = QLabel("● 离线/空闲: 0 台")
+        self.lbl_multi_kpi_idle.setStyleSheet("color: #71717A;")
+
+        kpi_layout.addWidget(QLabel("📊 集群概览:"))
+        kpi_layout.addSpacing(10)
+        kpi_layout.addWidget(self.lbl_multi_kpi_total)
+        kpi_layout.addSpacing(14)
+        kpi_layout.addWidget(self.lbl_multi_kpi_online)
+        kpi_layout.addSpacing(14)
+        kpi_layout.addWidget(self.lbl_multi_kpi_streaming)
+        kpi_layout.addSpacing(14)
+        kpi_layout.addWidget(self.lbl_multi_kpi_idle)
+        kpi_layout.addStretch()
+
+        tab_layout.addWidget(kpi_frame)
+
+        # ── 3. 多设备矩阵表格 ──
+        self.multi_table = QTableWidget()
+        self.multi_table.setColumnCount(9)
+        self.multi_table.setHorizontalHeaderLabels([
+            "#", "设备名称", "本地端口", "设备国标ID", "通道国标ID", "推流视频源", "注册状态", "推流状态", "操作"
+        ])
+        self.multi_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.multi_table.horizontalHeader().setStretchLastSection(True)
+        self.multi_table.verticalHeader().setVisible(False)
+        self.multi_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.multi_table.setAlternatingRowColors(True)
+        self.multi_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #18181B;
+                alternate-background-color: #111113;
+                color: #FAFAFA;
+                border: 1px solid #27272A;
+                border-radius: 6px;
+                gridline-color: #27272A;
+            }
+            QTableWidget::item {
+                padding: 4px;
+            }
+        """)
+        self.multi_table.setColumnWidth(0, 35)
+        self.multi_table.setColumnWidth(1, 115)
+        self.multi_table.setColumnWidth(2, 75)
+        self.multi_table.setColumnWidth(3, 175)
+        self.multi_table.setColumnWidth(4, 175)
+        self.multi_table.setColumnWidth(5, 140)
+        self.multi_table.setColumnWidth(6, 95)
+        self.multi_table.setColumnWidth(7, 95)
+        self.multi_table.setColumnWidth(8, 130)
+
+        tab_layout.addWidget(self.multi_table, 1)
+
+        return tab_widget
+
+    def _increment_gb_code(self, code_str, offset):
+        """递增国标编码最后几位数字"""
+        if not code_str:
+            return code_str
+        match = re.match(r'^(.*?)(\d+)$', code_str)
+        if match:
+            prefix, num_part = match.group(1), match.group(2)
+            new_num = int(num_part) + offset
+            return f"{prefix}{new_num:0{len(num_part)}d}"
+        return f"{code_str}_{offset}"
+
+    def on_multi_batch_generate(self):
+        start_port = self.multi_input_start_port.value()
+        start_dev_id = self.multi_input_start_device_id.text().strip() or "34020000001110000001"
+        start_ch_id = self.multi_input_start_channel_id.text().strip() or "34020000001320000001"
+        count = self.multi_input_count.value()
+        source_text = self.multi_combo_source.currentText()
+        
+        custom_url = self.input_custom_url.text().strip() if hasattr(self, 'input_custom_url') else "rtsp://127.0.0.1:8554/live"
+
+        existing_ports = {d["port"] for d in self.multi_devices}
+
+        for i in range(count):
+            port = start_port + i
+            while port in existing_ports:
+                port += 1
+            existing_ports.add(port)
+
+            self.multi_device_counter += 1
+            idx_name = f"模拟设备-{self.multi_device_counter:02d}"
+            dev_id = self._increment_gb_code(start_dev_id, i)
+            ch_id = self._increment_gb_code(start_ch_id, i)
+
+            dev_dict = {
+                "uid": f"dev_{self.multi_device_counter}_{int(time.time()*1000)}",
+                "name": idx_name,
+                "port": port,
+                "device_id": dev_id,
+                "channel_id": ch_id,
+                "source": source_text,
+                "custom_url": custom_url,
+                "thread": None,
+                "reg_state": "IDLE",
+                "media_state": "IDLE"
+            }
+            self.multi_devices.append(dev_dict)
+
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+        self.append_log(f"[集群] 成功批量生成 {count} 台模拟设备，当前集群共 {len(self.multi_devices)} 台。")
+
+    def on_multi_add_single(self):
+        start_port = self.multi_input_start_port.value()
+        existing_ports = {d["port"] for d in self.multi_devices}
+        port = start_port + len(self.multi_devices)
+        while port in existing_ports:
+            port += 1
+
+        self.multi_device_counter += 1
+        idx = len(self.multi_devices)
+        start_dev_id = self.multi_input_start_device_id.text().strip() or "34020000001110000001"
+        start_ch_id = self.multi_input_start_channel_id.text().strip() or "34020000001320000001"
+
+        dev_dict = {
+            "uid": f"dev_{self.multi_device_counter}_{int(time.time()*1000)}",
+            "name": f"模拟设备-{self.multi_device_counter:02d}",
+            "port": port,
+            "device_id": self._increment_gb_code(start_dev_id, idx),
+            "channel_id": self._increment_gb_code(start_ch_id, idx),
+            "source": self.multi_combo_source.currentText(),
+            "custom_url": self.input_custom_url.text().strip() if hasattr(self, 'input_custom_url') else "rtsp://127.0.0.1:8554/live",
+            "thread": None,
+            "reg_state": "IDLE",
+            "media_state": "IDLE"
+        }
+        self.multi_devices.append(dev_dict)
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+        self.append_log(f"[集群] 已添加设备 [{dev_dict['name']}] (Port: {port}, ID: {dev_dict['device_id']})")
+
+    def on_multi_clear_all(self):
+        self.on_multi_stop_all()
+        self.multi_devices.clear()
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+        self.append_log("[集群] 设备列表已清空。")
+
+    def refresh_multi_device_table(self):
+        self.multi_table.setRowCount(len(self.multi_devices))
+        for row_idx, dev in enumerate(self.multi_devices):
+            self._render_multi_device_row(row_idx, dev)
+
+    def _render_multi_device_row(self, row_idx, dev):
+        # 0. 序号
+        item_no = QTableWidgetItem(str(row_idx + 1))
+        item_no.setTextAlignment(Qt.AlignCenter)
+        self.multi_table.setItem(row_idx, 0, item_no)
+
+        # 1. 设备名称
+        item_name = QTableWidgetItem(dev["name"])
+        self.multi_table.setItem(row_idx, 1, item_name)
+
+        # 2. 本地端口
+        item_port = QTableWidgetItem(str(dev["port"]))
+        item_port.setTextAlignment(Qt.AlignCenter)
+        self.multi_table.setItem(row_idx, 2, item_port)
+
+        # 3. 设备国标ID
+        item_did = QTableWidgetItem(dev["device_id"])
+        self.multi_table.setItem(row_idx, 3, item_did)
+
+        # 4. 通道国标ID
+        item_cid = QTableWidgetItem(dev["channel_id"])
+        self.multi_table.setItem(row_idx, 4, item_cid)
+
+        # 5. 推流源
+        src_label = dev["source"]
+        if "彩条" in src_label:
+            src_label = "🌈 彩条测试图"
+        elif "摄像头" in src_label:
+            src_label = "📷 本地摄像头"
+        else:
+            src_label = "🎬 自定义流/文件"
+        item_src = QTableWidgetItem(src_label)
+        self.multi_table.setItem(row_idx, 5, item_src)
+
+        # 6. 注册状态
+        lbl_reg = QLabel()
+        lbl_reg.setAlignment(Qt.AlignCenter)
+        reg_st = dev["reg_state"]
+        if reg_st == "REGISTERED":
+            lbl_reg.setText("● 已注册")
+            lbl_reg.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
+        elif reg_st in ("REGISTERING", "AUTHENTICATING"):
+            lbl_reg.setText("● 正在注册...")
+            lbl_reg.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
+        elif reg_st == "FAILED":
+            lbl_reg.setText("● 注册失败")
+            lbl_reg.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 12px;")
+        else:
+            lbl_reg.setText("● 未连接")
+            lbl_reg.setStyleSheet("color: #71717A; font-size: 12px;")
+        self.multi_table.setCellWidget(row_idx, 6, lbl_reg)
+
+        # 7. 推流状态
+        lbl_media = QLabel()
+        lbl_media.setAlignment(Qt.AlignCenter)
+        media_st = dev["media_state"]
+        if media_st in ("STREAMING", "MANUAL"):
+            lbl_media.setText("● 正在推流")
+            lbl_media.setStyleSheet("color: #38BDF8; font-weight: bold; font-size: 12px;")
+        elif media_st == "STARTING":
+            lbl_media.setText("● 正在建流...")
+            lbl_media.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
+        elif media_st == "ERROR":
+            lbl_media.setText("● 推流异常")
+            lbl_media.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 12px;")
+        else:
+            lbl_media.setText("● 空闲")
+            lbl_media.setStyleSheet("color: #71717A; font-size: 12px;")
+        self.multi_table.setCellWidget(row_idx, 7, lbl_media)
+
+        # 8. 操作按钮列
+        op_widget = QWidget()
+        op_layout = QHBoxLayout(op_widget)
+        op_layout.setContentsMargins(4, 2, 4, 2)
+        op_layout.setSpacing(6)
+
+        is_running = dev["thread"] is not None
+
+        btn_toggle = QPushButton("停止" if is_running else "启动")
+        if is_running:
+            btn_toggle.setStyleSheet("QPushButton { background-color: #DC2626; color: white; border-radius: 4px; padding: 3px 8px; font-size: 11px; } QPushButton:hover { background-color: #EF4444; }")
+        else:
+            btn_toggle.setStyleSheet("QPushButton { background-color: #059669; color: white; border-radius: 4px; padding: 3px 8px; font-size: 11px; } QPushButton:hover { background-color: #10B981; }")
+        
+        uid = dev["uid"]
+        btn_toggle.clicked.connect(lambda _, u=uid: self.toggle_single_multi_device(u))
+        op_layout.addWidget(btn_toggle)
+
+        btn_delete = QPushButton("删除")
+        btn_delete.setEnabled(not is_running)
+        btn_delete.setStyleSheet("QPushButton { background-color: #27272A; border: 1px solid #3F3F46; color: #A1A1AA; border-radius: 4px; padding: 3px 8px; font-size: 11px; } QPushButton:hover { background-color: #3F3F46; color: #FAFAFA; }")
+        btn_delete.clicked.connect(lambda _, u=uid: self.remove_single_multi_device(u))
+        op_layout.addWidget(btn_delete)
+
+        self.multi_table.setCellWidget(row_idx, 8, op_widget)
+
+    def _build_multi_device_config(self, dev):
+        local_ips = get_all_local_ips()
+        server_ip = self.multi_input_server_ip.text().strip() or "127.0.0.1"
+        local_ip = best_local_ip_for_server(server_ip, local_ips)
+
+        return {
+            "SIP_SERVER_IP": server_ip,
+            "SIP_SERVER_PORT": int(self.multi_input_server_port.text().strip() or "5060"),
+            "SIP_SERVER_ID": self.multi_input_server_id.text().strip() or "34020000002000000001",
+            "LOCAL_IP": local_ip,
+            "LOCAL_PORT": int(dev["port"]),
+            "DEVICE_ID": dev["device_id"],
+            "CHANNEL_ID": dev["channel_id"],
+            "PASSWORD": self.multi_input_password.text().strip() or "12345",
+            "camera_source_text": dev["source"],
+            "custom_url": dev.get("custom_url", ""),
+            "video_resolution": "1920x1080",
+            "video_fps": "25",
+            "video_bitrate": "2048",
+            "enable_audio": False,
+            "audio_source_text": "默认音频输入",
+            "device_name": dev["name"],
+            "manufacturer": "AntigravitySim",
+            "model": "GB28181-SimCluster",
+            "civil_code": "310115",
+            "address": "Shanghai-Lab",
+            "owner": "COMAC",
+            "HEARTBEAT_INTERVAL": 15,
+            "EXPIRE_TIME": 3600,
+            "channels": [{
+                "channel_id": dev["channel_id"],
+                "name": dev["name"],
+                "camera_source_text": dev["source"],
+                "custom_url": dev.get("custom_url", "")
+            }]
+        }
+
+    def start_single_multi_device(self, uid):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if not dev or dev["thread"] is not None:
+            return
+
+        cfg_dict = self._build_multi_device_config(dev)
+        dev["reg_state"] = "REGISTERING"
+        dev["media_state"] = "IDLE"
+
+        thread = DeviceThread(cfg_dict, log_prefix=dev["name"])
+        thread.registration_state_changed.connect(lambda st, msg, u=uid: self.on_multi_reg_state_changed(u, st, msg))
+        thread.media_state_changed.connect(lambda st, msg, u=uid: self.on_multi_media_state_changed(u, st, msg))
+        thread.finished.connect(lambda u=uid: self.on_multi_thread_finished(u))
+        
+        dev["thread"] = thread
+        thread.start()
+        
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+
+    def stop_single_multi_device(self, uid):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if not dev or dev["thread"] is None:
+            return
+
+        thread = dev["thread"]
+        dev["thread"] = None
+        dev["reg_state"] = "IDLE"
+        dev["media_state"] = "IDLE"
+        
+        try:
+            thread.stop()
+        except Exception:
+            pass
+
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+        self.append_log(f"[集群] 设备 [{dev['name']}] 已停止。")
+
+    def toggle_single_multi_device(self, uid):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if not dev:
+            return
+        if dev["thread"] is not None:
+            self.stop_single_multi_device(uid)
+        else:
+            self.start_single_multi_device(uid)
+
+    def remove_single_multi_device(self, uid):
+        self.stop_single_multi_device(uid)
+        self.multi_devices = [d for d in self.multi_devices if d["uid"] != uid]
+        self.refresh_multi_device_table()
+        self.update_multi_kpi_summary()
+
+    def on_multi_start_all(self):
+        self.append_log(f"[集群] 正在一键启动集群全部 {len(self.multi_devices)} 台设备...")
+        for dev in self.multi_devices:
+            if dev["thread"] is None:
+                self.start_single_multi_device(dev["uid"])
+                time.sleep(0.08)  # 平滑错开注册，防止并发洪峰
+
+    def on_multi_stop_all(self):
+        self.append_log("[集群] 正在停止集群中所有设备...")
+        for dev in self.multi_devices:
+            if dev["thread"] is not None:
+                self.stop_single_multi_device(dev["uid"])
+        MediaController.kill_bundled_ffmpeg_processes(log_signaler.log_signal.emit)
+
+    def on_multi_reg_state_changed(self, uid, state, msg):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if dev:
+            dev["reg_state"] = state
+            self.refresh_multi_device_table()
+            self.update_multi_kpi_summary()
+
+    def on_multi_media_state_changed(self, uid, state, msg):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if dev:
+            dev["media_state"] = state
+            self.refresh_multi_device_table()
+            self.update_multi_kpi_summary()
+
+    def on_multi_thread_finished(self, uid):
+        dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
+        if dev and dev["thread"] is not None:
+            dev["thread"] = None
+            dev["reg_state"] = "IDLE"
+            dev["media_state"] = "IDLE"
+            self.refresh_multi_device_table()
+            self.update_multi_kpi_summary()
+
+    def update_multi_kpi_summary(self):
+        total = len(self.multi_devices)
+        online = sum(1 for d in self.multi_devices if d["reg_state"] == "REGISTERED")
+        streaming = sum(1 for d in self.multi_devices if d["media_state"] in ("STREAMING", "MANUAL"))
+        idle = total - online
+
+        self.lbl_multi_kpi_total.setText(f"总设备: {total} 台")
+        self.lbl_multi_kpi_online.setText(f"● 在线注册: {online} 台")
+        self.lbl_multi_kpi_streaming.setText(f"● 正在推流: {streaming} 台")
+        self.lbl_multi_kpi_idle.setText(f"● 离线/空闲: {max(0, idle)} 台")
+
     def closeEvent(self, event):
         self.stop_device()
         self.stop_preview()
         self.stop_manual_push()
+        self.on_multi_stop_all()
         MediaController.kill_bundled_ffmpeg_processes(log_signaler.log_signal.emit)
         event.accept()
 
