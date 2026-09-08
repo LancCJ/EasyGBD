@@ -46,6 +46,17 @@ class GB28181Device:
         self._auth_realm = None
         self._auth_nonce = None
         self._stopping = False
+        
+        # 异常重试与断线重连控制
+        self.max_registration_retries = int(getattr(self.config, 'MAX_REGISTRATION_RETRIES', 5))  # 默认最多重试5次，0为无限重试
+        self.retry_count = 0
+        self._retry_timer_deadline = None
+        
+        # 心跳丢失检测与租期刷新注册
+        self._missed_heartbeats = 0
+        self.MAX_MISSED_HEARTBEATS = 3
+        self._last_register_time = 0.0
+
         self.ptz_pan = float(getattr(self.config, 'ptz_pan', 0.0))
         self.ptz_tilt = float(getattr(self.config, 'ptz_tilt', 0.0))
         self.ptz_zoom = float(getattr(self.config, 'ptz_zoom', 1.0))
@@ -61,7 +72,7 @@ class GB28181Device:
 
     def _set_registration_state(self, state, message):
         self.registration_state = state
-        self.registration_error = message if state == "FAILED" else ""
+        self.registration_error = message if state in ("FAILED", "RETRYING") else ""
         if self.state_callback:
             self.state_callback(state, message)
 
@@ -89,14 +100,34 @@ class GB28181Device:
         self._active_invite_callid = None
         self._set_media_state("ERROR", reason)
 
-    def _registration_failed(self, message):
-        if self.registration_state == "FAILED":
+    def _registration_fatal_error(self, message):
+        """不可恢复的致命注册错误（凭据错误/平台明确拒绝/端口冲突），终止运行"""
+        self.is_registered = False
+        self._registration_deadline = None
+        self._retry_timer_deadline = None
+        self.retry_count = 0
+        self.log(f"[注册失败] 致命错误终止: {message}")
+        self._set_registration_state("FAILED", message)
+        self.running = False
+
+    def _schedule_registration_retry(self, reason):
+        """可恢复网络或平台异常（超时、500/503、心跳断开），触发退避重试"""
+        if not self.running or self._stopping:
             return
         self.is_registered = False
         self._registration_deadline = None
-        self.log(f"[注册失败] {message}")
-        self._set_registration_state("FAILED", message)
-        self.running = False
+
+        if self.max_registration_retries > 0 and self.retry_count >= self.max_registration_retries:
+            self._registration_fatal_error(f"{reason}（已达最大重试上限 {self.max_registration_retries} 次）")
+            return
+
+        self.retry_count += 1
+        # 指数退避：3s -> 5s -> 8s -> 12s -> 最大15s
+        delay = min(15.0, 3.0 * (1.4 ** (self.retry_count - 1)))
+        self._retry_timer_deadline = time.monotonic() + delay
+        retry_msg = f"{reason}，将在 {int(delay)} 秒后自动重试（第 {self.retry_count} 次）"
+        self.log(f"[注册异常] {retry_msg}")
+        self._set_registration_state("RETRYING", retry_msg)
 
     def _bind_socket(self):
         """尝试绑定 UDP 套接字，失败则记录错误并返回 False"""
@@ -142,21 +173,27 @@ class GB28181Device:
         self.send_msg(msg)
         self.cseq += 1
 
-    def register(self):
-        self.log("[SIP] Sending Initial REGISTER...")
+    def register(self, is_retry=False):
+        if is_retry:
+            self.log(f"[SIP] Sending Retry REGISTER (第 {self.retry_count} 次)...")
+            self.call_id = self.config.generate_call_id()
+        else:
+            self.log("[SIP] Sending Initial REGISTER...")
         self._auth_attempted = False
         self._registration_deadline = time.monotonic() + self.REGISTRATION_TIMEOUT_SECONDS
-        self._set_registration_state("REGISTERING", "正在向上级平台发送注册请求")
+        self._retry_timer_deadline = None
+        state_text = f"正在向上级平台发送注册请求{' (第' + str(self.retry_count) + '次重试)' if is_retry else ''}"
+        self._set_registration_state("REGISTERING", state_text)
         msg = sip_stack.build_register_msg(self.config, self.cseq, self.call_id)
         if not self.send_msg(msg):
-            self._registration_failed("注册请求发送失败，请检查本地网络和UDP端口")
+            self._schedule_registration_retry("注册请求发送失败，本地网络或UDP端口异常")
         self.cseq += 1
 
     def handle_auth(self, parsed_msg):
         self.log("[SIP] Handling 401 Unauthorized (Digest Auth)...")
         auth_header = sip_stack.get_header(parsed_msg, 'WWW-Authenticate')
         if not auth_header:
-            self._registration_failed("平台返回401，但未携带WWW-Authenticate认证参数")
+            self._registration_fatal_error("平台返回401，但未携带WWW-Authenticate认证参数")
             return
         
         realm_match = re.search(r'realm="([^"]+)"', auth_header)
@@ -178,49 +215,66 @@ class GB28181Device:
             self._registration_deadline = time.monotonic() + self.REGISTRATION_TIMEOUT_SECONDS
             self._set_registration_state("AUTHENTICATING", f"平台要求Digest认证（Realm: {realm}）")
             if not self.send_msg(msg):
-                self._registration_failed("认证注册请求发送失败，请检查网络连接")
+                self._schedule_registration_retry("认证注册请求发送失败，请检查网络连接")
             self.cseq += 1
         else:
-            self._registration_failed("平台返回的Digest认证参数不完整，缺少realm或nonce")
+            self._registration_fatal_error("平台返回的Digest认证参数不完整，缺少realm或nonce")
 
     def _handle_register_response(self, parsed_msg, status_code, reason):
         if status_code == 401:
             if self._auth_attempted:
-                self._registration_failed("认证失败（401）：请检查设备国标ID、注册密码和认证域")
+                self._registration_fatal_error("认证失败（401）：请检查设备国标ID、注册密码和认证域")
             else:
                 self.handle_auth(parsed_msg)
             return
 
         if 200 <= status_code < 300:
             self._registration_deadline = None
+            self._retry_timer_deadline = None
+            self.retry_count = 0
+            self._missed_heartbeats = 0
+            self._last_register_time = time.monotonic()
             if not self.is_registered:
                 self.log("[SIP] Registration Successful!")
                 self.is_registered = True
                 self._set_registration_state("REGISTERED", "设备注册成功")
                 self._send_device_info()
+            else:
+                self.log("[SIP] Refresh Registration Successful (租期已续签)")
             return
 
-        messages = {
+        fatal_messages = {
             400: "注册请求格式错误（400），请检查SIP报文参数",
             403: "平台拒绝注册（403）：设备可能未获准接入或已被拉黑",
             404: f"平台未找到设备（404）：请确认国标ID {self.config.DEVICE_ID} 已在平台配置或通过审核",
-            408: "平台注册处理超时（408），请稍后重试",
             423: "注册有效期过短（423），请按平台Min-Expires要求调整",
-            500: "平台内部错误（500），请检查平台服务日志",
-            503: "平台暂不可用（503），请稍后重试",
-            504: "平台网关超时（504），请检查平台网络",
         }
-        detail = messages.get(status_code,
-            f"平台注册失败：SIP {status_code} {reason or 'Unknown'}")
-        self._registration_failed(detail)
+        if status_code in fatal_messages:
+            self._registration_fatal_error(fatal_messages[status_code])
+            return
 
-    def _check_registration_timeout(self):
+        retry_messages = {
+            408: "平台注册处理超时（408）",
+            500: "平台内部错误（500）",
+            502: "平台网关错误（502）",
+            503: "平台服务暂不可用（503）",
+            504: "平台网关超时（504）",
+        }
+        detail = retry_messages.get(status_code, f"平台响应异常（SIP {status_code} {reason or 'Unknown'}）")
+        self._schedule_registration_retry(detail)
+
+    def _check_registration_timers(self):
+        # 1. 注册应答超时检测
         if (not self.is_registered and self._registration_deadline is not None
                 and time.monotonic() >= self._registration_deadline):
-            self._registration_failed(
-                f"注册超时：{self.REGISTRATION_TIMEOUT_SECONDS}秒内未收到平台响应，"
-                "请检查服务器IP、UDP端口和防火墙"
+            self._schedule_registration_retry(
+                f"注册超时：{self.REGISTRATION_TIMEOUT_SECONDS}秒内未收到平台响应"
             )
+
+        # 2. 退避重试定时器触发
+        if (not self.is_registered and self._retry_timer_deadline is not None
+                and time.monotonic() >= self._retry_timer_deadline):
+            self.register(is_retry=True)
 
     def _clamp_ptz_state(self, pan=None, tilt=None, zoom=None):
         pan = self.ptz_pan if pan is None else pan
@@ -335,18 +389,47 @@ class GB28181Device:
         self.apply_ptz_action(action, speed=speed, source="平台")
 
     def send_keepalive(self):
+        last_heartbeat_time = 0.0
         while self.running:
+            now = time.monotonic()
+            interval = getattr(self.config, 'HEARTBEAT_INTERVAL', 15)
+            expire_time = getattr(self.config, 'EXPIRE_TIME', 3600)
+            refresh_interval = max(60, int(expire_time * 0.7))
+
             if self.is_registered:
-                self.log(f"[SIP] Sending Keepalive (CSeq: {self.cseq})")
-                msg = sip_stack.build_keepalive_msg(self.config, self.cseq, self.config.generate_call_id())
-                self.send_msg(msg)
-                self.cseq += 1
-            
-            interval = getattr(self.config, 'HEARTBEAT_INTERVAL', 60)
-            for _ in range(interval):
-                if not self.running:
-                    break
-                time.sleep(1)
+                # 1. 检测连续心跳丢失（连续3次未收到200 OK响应判定掉线）
+                if self._missed_heartbeats >= self.MAX_MISSED_HEARTBEATS:
+                    self.log(
+                        f"[GB28181] 警告：连续 {self._missed_heartbeats} 次心跳未收到平台响应，判定与平台失联！准备重新注册..."
+                    )
+                    self._schedule_registration_retry("心跳超时，平台失联")
+                    time.sleep(1)
+                    continue
+
+                # 2. 定时发送心跳
+                if now - last_heartbeat_time >= interval:
+                    self._missed_heartbeats += 1
+                    self.log(
+                        f"[SIP] Sending Keepalive (CSeq: {self.cseq}, 待应答心跳: {self._missed_heartbeats})"
+                    )
+                    msg = sip_stack.build_keepalive_msg(
+                        self.config, self.cseq, self.config.generate_call_id()
+                    )
+                    self.send_msg(msg)
+                    self.cseq += 1
+                    last_heartbeat_time = now
+
+                # 3. 租期即将到期前自动刷新注册 (Refresh REGISTER)
+                if self._last_register_time > 0 and (now - self._last_register_time >= refresh_interval):
+                    self.log(
+                        f"[SIP] 注册租期过半 (Expires: {expire_time}s)，自动发送刷新注册维持在线..."
+                    )
+                    self._last_register_time = now
+                    msg = sip_stack.build_register_msg(self.config, self.cseq, self.call_id)
+                    self.send_msg(msg)
+                    self.cseq += 1
+
+            time.sleep(1)
 
     def handle_invite(self, parsed_msg):
         call_id = parsed_msg['headers'].get('Call-ID', '')
@@ -484,6 +567,8 @@ y={ssrc}
                             self._handle_register_response(parsed, status_code, reason)
                     elif 200 <= status_code < 300 and 'MESSAGE' in cseq.upper():
                         self.log(f"[GB28181] MESSAGE事务响应: SIP {status_code} {reason or 'OK'} / CSeq: {cseq}")
+                        # 收到心跳响应，清零丢失计数
+                        self._missed_heartbeats = 0
                 elif first_line.startswith("INVITE"):
                     self.handle_invite(parsed)
                 elif first_line.startswith("BYE"):
@@ -544,7 +629,7 @@ y={ssrc}
                     else:
                         self.log(f"[GB28181] 暂未实现的MESSAGE类型: CmdType={cmd_type}")
             except socket.timeout:
-                self._check_registration_timeout()
+                self._check_registration_timers()
                 continue
             except Exception as e:
                 if self.running:
@@ -554,9 +639,9 @@ y={ssrc}
         """启动设备：绑定端口后开始注册和接收循环"""
         # 绑定 UDP 端口（在 start 里做，不在构造函数里，避免多次 start/stop 时的端口残留问题）
         if not self._bind_socket():
-            message = "无法绑定本地UDP端口，请检查端口是否被其他程序占用"
+            message = f"无法绑定本地UDP端口 {self.config.LOCAL_PORT}，请检查端口是否被其他程序占用"
             self.log(f"[错误] {message}")
-            self._set_registration_state("FAILED", message)
+            self._registration_fatal_error(message)
             return
         
         self.running = True
@@ -604,6 +689,8 @@ y={ssrc}
         self.running = False
         self.is_registered = False
         self._registration_deadline = None
+        self._retry_timer_deadline = None
+        self.retry_count = 0
         self._set_registration_state("STOPPED", "设备已停止")
         self.media_ctrl.stop_stream()
         MediaController.kill_bundled_ffmpeg_processes(self.log)

@@ -1975,16 +1975,25 @@ class EasyGBDMacGUI(QMainWindow):
         if state == "REGISTERING":
             self.status_label.setText("● 正在注册...")
             self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #F59E0B;")
+            self.status_label.setToolTip(message or "正在发送注册请求")
         elif state == "AUTHENTICATING":
             self.status_label.setText("● 正在认证...")
             self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #F59E0B;")
+            self.status_label.setToolTip(message or "平台要求Digest摘要认证")
+        elif state == "RETRYING":
+            short_msg = message.split("，")[0] if "，" in message else "重试中..."
+            self.status_label.setText(f"● {short_msg}")
+            self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #F59E0B;")
+            self.status_label.setToolTip(message)
         elif state == "REGISTERED":
             self.status_label.setText("● 已注册")
             self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #10B981;")
+            self.status_label.setToolTip("注册成功，设备在线")
         elif state == "FAILED":
             self.status_label.setText("● 注册失败")
             self.status_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #EF4444;")
-            QMessageBox.warning(self, "设备注册失败", message)
+            self.status_label.setToolTip(message)
+            self.append_log(f"[注册终止] 无法恢复的错误: {message}")
 
     def stop_device(self):
         if self.thread:
@@ -2850,18 +2859,27 @@ class EasyGBDMacGUI(QMainWindow):
         lbl_reg = QLabel()
         lbl_reg.setAlignment(Qt.AlignCenter)
         reg_st = dev["reg_state"]
+        reg_msg = dev.get("reg_msg", "")
         if reg_st == "REGISTERED":
             lbl_reg.setText("● 已注册")
             lbl_reg.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
+            lbl_reg.setToolTip(reg_msg or "设备在线，已与平台建立注册")
         elif reg_st in ("REGISTERING", "AUTHENTICATING"):
             lbl_reg.setText("● 正在注册...")
             lbl_reg.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
+            lbl_reg.setToolTip(reg_msg or "正在进行SIP注册握手")
+        elif reg_st == "RETRYING":
+            lbl_reg.setText("● 重试中...")
+            lbl_reg.setStyleSheet("color: #F59E0B; font-weight: bold; font-size: 12px;")
+            lbl_reg.setToolTip(reg_msg or "连接异常，自动退避重连中")
         elif reg_st == "FAILED":
             lbl_reg.setText("● 注册失败")
             lbl_reg.setStyleSheet("color: #EF4444; font-weight: bold; font-size: 12px;")
+            lbl_reg.setToolTip(reg_msg or "注册遇到不可恢复错误已终止")
         else:
             lbl_reg.setText("● 未连接")
             lbl_reg.setStyleSheet("color: #71717A; font-size: 12px;")
+            lbl_reg.setToolTip(reg_msg or "设备停止/空闲")
         self.multi_table.setCellWidget(row_idx, 6, lbl_reg)
 
         # 7. 推流状态
@@ -3017,6 +3035,7 @@ class EasyGBDMacGUI(QMainWindow):
         dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
         if dev:
             dev["reg_state"] = state
+            dev["reg_msg"] = msg
             self.refresh_multi_device_table()
             self.update_multi_kpi_summary()
 
@@ -3031,7 +3050,8 @@ class EasyGBDMacGUI(QMainWindow):
         dev = next((d for d in self.multi_devices if d["uid"] == uid), None)
         if dev and dev["thread"] is not None:
             dev["thread"] = None
-            dev["reg_state"] = "IDLE"
+            if dev.get("reg_state") != "FAILED":
+                dev["reg_state"] = "IDLE"
             dev["media_state"] = "IDLE"
             self.refresh_multi_device_table()
             self.update_multi_kpi_summary()
