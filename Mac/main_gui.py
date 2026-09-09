@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QInputDialog, QTabWidget, QTableWidget, QTableWidgetItem,
                              QHeaderView, QSpinBox, QAbstractItemView)
 from PySide6.QtCore import (
-    QCameraPermission, Qt, QThread, QTimer, Signal, QObject, QUrl, QSizeF
+    QCameraPermission, QMicrophonePermission, Qt, QThread, QTimer, Signal, QObject, QUrl, QSizeF
 )
 from PySide6.QtGui import QTransform
 from PySide6.QtMultimedia import (
@@ -62,6 +62,36 @@ def best_local_ip_for_server(server_ip, all_ips):
         if ip.startswith(prefix2 + "."):
             return ip
     return all_ips[0]
+
+
+def get_primary_physical_ip(ips=None):
+    """
+    获取当前主要物理真实局域网 IP，优先物理 Wi-Fi / 以太网网段（如 192.168.x），
+    排除 127.0.0.1 环回与 198.18.* 等代理虚拟网卡。
+    """
+    if ips is None:
+        ips = get_all_local_ips()
+    candidates = []
+    for ip in ips:
+        if not ip or ip == "127.0.0.1":
+            continue
+        if ip.startswith("198.18.") or ip.startswith("198.19."):
+            continue
+        candidates.append(ip)
+
+    if not candidates:
+        return "127.0.0.1"
+
+    # 优先物理 Wi-Fi / 以太网最常见的 192.168.x 网段
+    for ip in candidates:
+        if ip.startswith("192.168."):
+            return ip
+    # 其次排除常见的 Parallels 虚拟机私有宿主段 (10.211.55.x, 10.37.129.x)
+    for ip in candidates:
+        if not (ip.startswith("10.211.55.") or ip.startswith("10.37.129.")):
+            return ip
+
+    return candidates[0]
 
 
 def get_backend_default_config():
@@ -632,6 +662,14 @@ class EasyGBDMacGUI(QMainWindow):
         self._loading_channel_ui = False
         self.multi_devices = []
         self.multi_device_counter = 0
+
+        # 网络环境变动检测与自动恢复状态
+        self.last_local_ips = get_all_local_ips()
+        self.last_primary_ip = get_primary_physical_ip(self.last_local_ips)
+        self._is_recovering_network = False
+        self._network_disconnected_waiting = False
+        self._was_running_before_disconnect = False
+
         self.init_ui()
 
     def init_ui(self):
@@ -1014,6 +1052,12 @@ class EasyGBDMacGUI(QMainWindow):
         basic_layout.addRow("", self.check_mirror)
         basic_layout.addRow("", self.check_audio)
         basic_layout.addRow("麦克风设备:", self.input_audio)
+
+        self.check_auto_recovery = QCheckBox("网络变更自动切换IP并重新注册")
+        self.check_auto_recovery.setStyleSheet("QCheckBox { color: #818CF8; font-weight: 600; }")
+        self.check_auto_recovery.setChecked(True)
+        self.check_auto_recovery.setToolTip("开启后，当检测到 Mac Wi-Fi 切换或网络断开变动时，自动更新 IP 并恢复注册")
+        basic_layout.addRow("", self.check_auto_recovery)
 
         left_layout.addWidget(basic_frame)
 
@@ -1425,6 +1469,11 @@ class EasyGBDMacGUI(QMainWindow):
         self.stream_health_timer.timeout.connect(self.check_stream_health)
         self.stream_health_timer.start()
 
+        self.network_monitor_timer = QTimer(self)
+        self.network_monitor_timer.setInterval(2500)
+        self.network_monitor_timer.timeout.connect(self.check_network_change)
+        self.network_monitor_timer.start()
+
     # ---- 辅助方法 ----
 
     def current_base_channel(self):
@@ -1695,7 +1744,28 @@ class EasyGBDMacGUI(QMainWindow):
             self.video_view.setMirrored(self.check_mirror.isChecked())
 
     def on_audio_toggled(self, state):
-        self.input_audio.setEnabled(self.check_audio.isChecked())
+        enabled = self.check_audio.isChecked()
+        self.input_audio.setEnabled(enabled)
+        if enabled:
+            perm = QMicrophonePermission()
+            status = QApplication.instance().checkPermission(perm)
+            if status == Qt.PermissionStatus.Undetermined:
+                self.append_log("[系统] 正在请求 macOS 麦克风访问权限...")
+                QApplication.instance().requestPermission(
+                    perm,
+                    self,
+                    lambda result: self.on_microphone_permission_result(result)
+                )
+            elif status == Qt.PermissionStatus.Denied:
+                self.append_log("[警告] macOS 未授权麦克风访问，请在“系统设置 → 隐私与安全性 → 麦克风”中允许 OpenGBD。")
+            else:
+                self.append_log("[系统] 音频推流已启用 (G.711 A-Law / 8kHz / 单声道)")
+
+    def on_microphone_permission_result(self, permission):
+        if permission.status() == Qt.PermissionStatus.Granted:
+            self.append_log("[系统] 麦克风权限已成功授权。")
+        else:
+            self.append_log("[警告] 麦克风权限被拒绝，请在“系统设置 → 隐私与安全性 → 麦克风”中开启，否则推流可能无声音。")
 
     def auto_select_local_ip(self, server_ip):
         best = best_local_ip_for_server(server_ip.strip(), self.local_ips)
@@ -1869,7 +1939,8 @@ class EasyGBDMacGUI(QMainWindow):
             'video_bitrate': self.input_video_bitrate.currentText().strip() or '1000',
             'video_mirror': self.check_mirror.isChecked(),
             'audio_enabled': self.check_audio.isChecked(),
-            'audio_source_idx': self.input_audio.currentIndex(),
+            'audio_source_idx': max(0, self.input_audio.currentIndex() - 1) if self.input_audio.currentIndex() > 0 else 0,
+            'audio_source_text': self.input_audio.currentText(),
             'audio_devices_list': [dev.description() for dev in self.audio_devices],
             'local_preview_port': 23000,
             'ptz_pan': self.ptz_pan,
@@ -1953,6 +2024,161 @@ class EasyGBDMacGUI(QMainWindow):
                     "平台点播推流 FFmpeg 进程已退出，当前未检测到本机推流。"
                 )
                 device.mark_media_interrupted(reason)
+
+    def check_network_change(self):
+        """定期检测 Mac 网络环境是否发生变动（Wi-Fi 切换、拔插网线、热点切换等）"""
+        if self._is_recovering_network:
+            return
+
+        current_ips = get_all_local_ips()
+        current_primary_ip = get_primary_physical_ip(current_ips)
+
+        has_physical_ip = (
+            current_primary_ip
+            and current_primary_ip != "127.0.0.1"
+            and not current_primary_ip.startswith("198.18.")
+            and not current_primary_ip.startswith("198.19.")
+        )
+
+        # 1. 检测断网瞬间（无有效物理局域网 IP，通常是 Wi-Fi 切换中间状态）
+        if not has_physical_ip:
+            if not self._network_disconnected_waiting:
+                self._network_disconnected_waiting = True
+                self._was_running_before_disconnect = (
+                    self.thread is not None and self.thread.isRunning()
+                )
+                if self._was_running_before_disconnect:
+                    self.append_log("[网络感知] ⚠️ 检测到网络物理连接已断开，暂停通信，等待新网络就绪...")
+            return
+
+        # 2. 从断网过渡状态恢复到新网络
+        if self._network_disconnected_waiting:
+            self._network_disconnected_waiting = False
+            old_ips = list(self.last_local_ips)
+            old_primary = self.last_primary_ip
+            self.last_local_ips = current_ips
+            self.last_primary_ip = current_primary_ip
+            self.handle_network_change(old_ips, current_ips, old_primary, current_primary_ip)
+            return
+
+        # 3. 正常运行中检测到物理 IP 变动或当前选择的本地 IP 已失效
+        current_selected_local_ip = self.input_local_ip.currentText().strip()
+        ip_changed = (
+            current_primary_ip != self.last_primary_ip
+            or (current_selected_local_ip and current_selected_local_ip not in current_ips and current_selected_local_ip != "0.0.0.0")
+        )
+
+        if ip_changed:
+            old_ips = list(self.last_local_ips)
+            old_primary = self.last_primary_ip
+            self.last_local_ips = current_ips
+            self.last_primary_ip = current_primary_ip
+            self.handle_network_change(old_ips, current_ips, old_primary, current_primary_ip)
+
+    def handle_network_change(self, old_ips, current_ips, old_primary, new_primary):
+        """处理网络环境变更：刷新候选列表、自动切换本地 IP 与服务器 IP，并在必要时自恢复注册"""
+        self.append_log(
+            f"[网络感知] ⚠️ 检测到 Mac 网络环境变更: 主物理 IP 从 {old_primary} 变更为 {new_primary}"
+        )
+        self.local_ips = current_ips
+
+        # 1. 刷新 本地 IP 下拉框
+        self.input_local_ip.blockSignals(True)
+        self.input_local_ip.clear()
+        self.input_local_ip.addItems(current_ips)
+        new_local = new_primary if new_primary in current_ips else (current_ips[0] if current_ips else "127.0.0.1")
+        idx_local = self.input_local_ip.findText(new_local)
+        if idx_local >= 0:
+            self.input_local_ip.setCurrentIndex(idx_local)
+        else:
+            self.input_local_ip.setEditText(new_local)
+        self.input_local_ip.blockSignals(False)
+        self.append_log(f"[网络感知] 本地 IP 已自动切换为: {new_local}")
+
+        # 2. 判定并自动更新 服务器 IP
+        curr_server = self.input_server_ip.currentText().strip()
+        should_switch_server = False
+
+        # 如果服务器原设置为：
+        # - 旧的主物理 IP
+        # - 在旧的本地 IP 列表中（说明指向本机部署的平台）
+        # - 是 "0.0.0.0"、空或 "127.0.0.1"
+        # - 或者与旧的主物理 IP 在同一 /24 网段
+        old_prefix = ".".join(old_primary.split(".")[:3]) if old_primary else ""
+        server_prefix = ".".join(curr_server.split(".")[:3]) if curr_server else ""
+
+        if (
+            curr_server == old_primary
+            or curr_server in old_ips
+            or curr_server in ("0.0.0.0", "", "127.0.0.1")
+            or (old_prefix and server_prefix == old_prefix)
+        ):
+            should_switch_server = True
+
+        self.input_server_ip.blockSignals(True)
+        self.input_server_ip.clear()
+        self.input_server_ip.addItems(current_ips)
+
+        if should_switch_server:
+            new_server = new_primary
+            idx_server = self.input_server_ip.findText(new_server)
+            if idx_server >= 0:
+                self.input_server_ip.setCurrentIndex(idx_server)
+            else:
+                self.input_server_ip.setEditText(new_server)
+            self.append_log(f"[网络感知] 检测到原服务器指向本机/旧网段，服务器 IP 已自动跟随切换为: {new_server}")
+        else:
+            # 保持原外部固定服务器 IP
+            idx_server = self.input_server_ip.findText(curr_server)
+            if idx_server >= 0:
+                self.input_server_ip.setCurrentIndex(idx_server)
+            else:
+                self.input_server_ip.setEditText(curr_server)
+            self.append_log(f"[网络感知] 保持外部服务器 IP 不变: {curr_server}")
+        self.input_server_ip.blockSignals(False)
+
+        # 3. 同步更新多设备模拟集群（Tab 2）的服务器 IP（若指向旧本机则更新）
+        if hasattr(self, 'multi_input_server_ip'):
+            multi_srv = self.multi_input_server_ip.text().strip()
+            multi_prefix = ".".join(multi_srv.split(".")[:3]) if multi_srv else ""
+            if (
+                multi_srv == old_primary
+                or multi_srv in old_ips
+                or multi_srv in ("0.0.0.0", "127.0.0.1", "")
+                or (old_prefix and multi_prefix == old_prefix)
+            ):
+                self.multi_input_server_ip.setText(new_primary)
+                self.append_log(f"[网络感知] 集群测试服务器 IP 已同步更新为: {new_primary}")
+
+        # 4. 判断是否开启自动恢复功能
+        is_auto_recovery = getattr(self, 'check_auto_recovery', None)
+        auto_enabled = is_auto_recovery.isChecked() if is_auto_recovery else True
+        if not auto_enabled:
+            self.append_log("[网络感知] 自动切换恢复未勾选，请核对配置后手动点击启动。")
+            return
+
+        # 5. 如果换网络前设备处于运行中（或断网前处于运行中），执行平滑自恢复重新注册
+        was_running = (
+            (self.thread is not None and self.thread.isRunning())
+            or getattr(self, '_was_running_before_disconnect', False)
+        )
+        self._was_running_before_disconnect = False
+
+        if was_running:
+            self._is_recovering_network = True
+            self.append_log("[网络自愈] 正在执行平滑自愈：停止旧会话并以新 IP 重新向平台注册...")
+            self.stop_device()
+
+            # 延迟 800 毫秒启动，留出足够时间释放 macOS 底层端口和旧套接字
+            def _do_restart():
+                try:
+                    self.append_log(f"[网络自愈] 网络栈已就绪，正在以新 IP ({new_local}) 发起注册上线...")
+                    self.start_device()
+                finally:
+                    self._is_recovering_network = False
+
+            QTimer.singleShot(800, _do_restart)
+
 
     def start_device(self):
         if self.is_manual_pushing:

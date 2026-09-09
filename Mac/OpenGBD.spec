@@ -50,5 +50,6 @@ app = BUNDLE(
     info_plist={
         'NSCameraUsageDescription': '需要访问相机用于 GB28181 视频采集与推流',
         'NSCameraUseContinuityCameraDeviceType': True,
+        'NSMicrophoneUsageDescription': '需要访问麦克风用于 GB28181 语音与音频采集推流',
     }
 )

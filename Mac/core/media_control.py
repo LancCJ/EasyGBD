@@ -232,6 +232,8 @@ class MediaController:
         # 音频编码参数：G.711 A-Law 8kHz，国标 GB28181 标准格式
         audio_params = ["-acodec", "pcm_alaw", "-ar", "8000", "-ac", "1"] if audio_enabled else ["-an"]
 
+        audio_device = str(getattr(self.config, 'audio_source_idx', 0))
+
         if "【自定义源】" in source_text:
             # 自定义流（RTSP/RTMP）或本地视频文件
             # 如果为空则兜底使用虚拟源
@@ -263,8 +265,13 @@ class MediaController:
             ])
             
             self._append_video_filters(ffmpeg_cmd, video_resolution, video_mirror)
+
+            # 若自定义源自身不含音频，加入 -map 容错，避免缺少音频流时报错
+            stream_maps = ["-map", "0:v:0"]
+            if audio_enabled:
+                stream_maps.extend(["-map", "0:a?"])
                 
-            ffmpeg_cmd.extend([
+            ffmpeg_cmd.extend(stream_maps + [
                 "-vcodec", "libx264",
                 "-profile:v", "baseline",
                 "-level", "3.1",
@@ -293,10 +300,19 @@ class MediaController:
                 "-video_size", video_resolution,
                 "-i", f"{screen_name}:none",
             ]
+
+            stream_maps = ["-map", "0:v:0"]
+            if audio_enabled:
+                # 桌面捕获同时抓取麦克风音频作为输入 1
+                ffmpeg_cmd.extend([
+                    "-f", "avfoundation",
+                    "-i", f"none:{audio_device}",
+                ])
+                stream_maps.extend(["-map", "1:a:0"])
             
             self._append_video_filters(ffmpeg_cmd, video_resolution, video_mirror)
                 
-            ffmpeg_cmd.extend([
+            ffmpeg_cmd.extend(stream_maps + [
                 "-vcodec", "libx264",
                 "-profile:v", "baseline",
                 "-level", "3.1",
@@ -330,22 +346,18 @@ class MediaController:
                 self.media_ctrl_print(
                     f"[Media] Mac 摄像头固定以 {capture_fps}fps 采集，再编码输出为 {video_fps}fps，避免 avfoundation 低帧率打开失败"
                 )
-                    
+
+            # avfoundation 支持单会话同时指定音视频输入 "<video>:<audio>"
+            video_input = clean_desc or actual_idx
+            audio_input = audio_device if audio_enabled else "none"
+            
             ffmpeg_cmd = [
                 ffmpeg_path,
                 "-f", "avfoundation",
                 "-framerate", capture_fps,
                 "-video_size", capture_resolution,
-                "-i", f"{clean_desc or actual_idx}:none",
+                "-i", f"{video_input}:{audio_input}",
             ]
-
-            if audio_enabled:
-                # 摄像头和麦克风同时输入：用多路 -i
-                audio_device = str(audio_source_idx)
-                ffmpeg_cmd.extend([
-                    "-f", "avfoundation",
-                    "-i", f"none:{audio_device}",
-                ])
 
             self._append_video_filters(ffmpeg_cmd, video_resolution, video_mirror)
 
@@ -373,17 +385,18 @@ class MediaController:
                 "-i", f"testsrc=size={video_resolution}:rate={video_fps}",
             ]
 
+            stream_maps = ["-map", "0:v:0"]
             if audio_enabled:
-                # 虚拟源使用麦克风抓取音频
-                audio_device = str(audio_source_idx)
+                # 虚拟视频源结合麦克风音频作为输入 1
                 ffmpeg_cmd.extend([
                     "-f", "avfoundation",
                     "-i", f"none:{audio_device}",
                 ])
+                stream_maps.extend(["-map", "1:a:0"])
 
             self._append_video_filters(ffmpeg_cmd, video_resolution, video_mirror)
 
-            ffmpeg_cmd.extend([
+            ffmpeg_cmd.extend(stream_maps + [
                 "-vcodec", "libx264",
                 "-profile:v", "baseline",
                 "-level", "3.1",
