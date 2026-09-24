@@ -3,6 +3,7 @@ import random
 import re
 import socket
 import subprocess
+import threading
 import string
 import time
 import html
@@ -223,6 +224,18 @@ class ConfigMock:
         self.VIDEO_RESOLUTION = data.get('video_resolution', '1280x720')
         self.VIDEO_FPS = int(data.get('video_fps', 30))
         self.VIDEO_BITRATE = int(data.get('video_bitrate', 1000))
+        # 编码与协议版本使用内部稳定值保存，避免界面文案调整破坏已有预设。
+        self.VIDEO_CODEC = 'H265' if '265' in str(data.get('video_codec', 'H264')).upper() else 'H264'
+        audio_codec = str(data.get('audio_codec', 'G711A')).upper().replace('-', '').replace(' ', '')
+        self.AUDIO_CODEC = {
+            'G711U': 'G711U',
+            'PCMMULAW': 'G711U',
+            'G723': 'G723',
+            'G7231': 'G723',
+            'AAC': 'AAC',
+            'AACLC': 'AAC',
+        }.get(audio_codec, 'AAC' if 'AAC' in audio_codec else 'G711A')
+        self.GB28181_VERSION = '2022' if '2022' in str(data.get('gb28181_version', '2016')) else '2016'
         self.camera_source_text = data.get('camera_source_text', '')
         self.camera_devices_list = data.get('camera_devices_list', [])
         self.custom_url = data.get('custom_url', '')
@@ -230,6 +243,9 @@ class ConfigMock:
         self.audio_enabled = data.get('audio_enabled', False)
         self.audio_source_idx = int(data.get('audio_source_idx', 0))
         self.audio_devices_list = data.get('audio_devices_list', [])
+        self.talk_enabled = bool(data.get('talk_enabled', False))
+        talk_codec = str(data.get('talk_codec', 'G711A')).upper().replace('-', '').replace('_', '').replace(' ', '')
+        self.TALK_CODEC = 'G711U' if ('711U' in talk_codec or 'MULAW' in talk_codec) else 'G711A'
         self.LOCAL_PREVIEW_PORT = int(data.get('local_preview_port', 23000))
         self.ptz_pan = float(data.get('ptz_pan', 0.0))
         self.ptz_tilt = float(data.get('ptz_tilt', 0.0))
@@ -298,6 +314,9 @@ class DeviceThread(QThread):
         self.device = None
         self.last_registration_state = "IDLE"
         self.last_registration_message = ""
+        # stop() 可能在 QThread 刚启动、设备实例尚未创建时被调用。
+        # 用 Event 记录该请求，避免线程随后仍启动 SIP 会话而留下幽灵设备。
+        self._stop_requested = threading.Event()
 
     def _log(self, msg):
         prefix = f"[{self.log_prefix}] " if self.log_prefix else ""
@@ -314,6 +333,8 @@ class DeviceThread(QThread):
 
     def run(self):
         try:
+            if self._stop_requested.is_set():
+                return
             config_obj = ConfigMock(self.config_data)
             self.device = GB28181Device(
                 config_obj,
@@ -323,11 +344,18 @@ class DeviceThread(QThread):
                 media_state_callback=self.media_state_changed.emit,
                 media_preview_callback=self.media_preview_changed.emit,
             )
+            # 供设备在 UDP 端口绑定等耗时步骤之间继续感知 stop()，避免
+            # 错峰启动的设备在“停止全部”后又开始注册。
+            self.device.stop_event = self._stop_requested
+            if self._stop_requested.is_set():
+                self.device.stop()
+                return
             self.device.start()
         except Exception as e:
             self._log(f"[错误] 设备线程崩溃: {e}")
 
     def stop(self):
+        self._stop_requested.set()
         if self.device:
             self.device.stop()
         self.wait()
@@ -662,6 +690,7 @@ class EasyGBDMacGUI(QMainWindow):
         self._loading_channel_ui = False
         self.multi_devices = []
         self.multi_device_counter = 0
+        self._multi_start_queue = []
 
         # 网络环境变动检测与自动恢复状态
         self.last_local_ips = get_all_local_ips()
@@ -918,6 +947,15 @@ class EasyGBDMacGUI(QMainWindow):
         self.input_channel_id = QLineEdit("34020000001320000002")
         self.input_channel_id.textChanged.connect(self.update_current_channel_from_ui)
 
+        self.input_gb28181_version = QComboBox()
+        setup_combobox_popup(self.input_gb28181_version)
+        self.input_gb28181_version.addItem("GB/T 28181-2016（默认）", "2016")
+        self.input_gb28181_version.addItem("GB/T 28181-2022", "2022")
+        self.input_gb28181_version.setToolTip(
+            "选择设备模拟的目标国标版本。两种模式均使用 SIP / MANSCDP / PS-over-RTP；"
+            "2022 模式可使用 H.265、AAC 等已实现能力，但不代表自动具备该标准的全部扩展功能。"
+        )
+
         # 密码
         self.pwd_container = QWidget()
         pwd_layout = QHBoxLayout(self.pwd_container)
@@ -1016,6 +1054,12 @@ class EasyGBDMacGUI(QMainWindow):
         self.input_video_bitrate.setCurrentText("2000")
         self.input_video_bitrate.setEnabled(False)
 
+        self.input_video_codec = QComboBox()
+        setup_combobox_popup(self.input_video_codec)
+        self.input_video_codec.addItem("H.264 / AVC（默认）", "H264")
+        self.input_video_codec.addItem("H.265 / HEVC（建议 GB/T 28181-2022）", "H265")
+        self.input_video_codec.setToolTip("视频将按所选编码由 FFmpeg 实际转码后推送。")
+
         self.check_mirror = QCheckBox("镜像翻转画面 (左右反转)")
         self.check_mirror.setStyleSheet("QCheckBox { color: #D4D4D8; }")
         self.check_mirror.setChecked(True)
@@ -1025,15 +1069,42 @@ class EasyGBDMacGUI(QMainWindow):
         from PySide6.QtMultimedia import QMediaDevices as _QMD
         self.audio_devices = _QMD.audioInputs()
         audio_names = ["【默认麦克风】"] + [f"【麦克风】{dev.description()}" for dev in self.audio_devices]
-        self.check_audio = QCheckBox("开启音频推流 (G.711 A-Law)")
+        self.check_audio = QCheckBox("开启音频推流（下方选择编码）")
         self.check_audio.setStyleSheet("QCheckBox { color: #D4D4D8; }")
         self.check_audio.setChecked(False)
         self.check_audio.stateChanged.connect(self.on_audio_toggled)
+
+        self.input_audio_codec = QComboBox()
+        setup_combobox_popup(self.input_audio_codec)
+        self.input_audio_codec.addItem("G.711 A-Law（默认）", "G711A")
+        self.input_audio_codec.addItem("G.711 μ-Law", "G711U")
+        self.input_audio_codec.addItem("G.723.1（6.3 kbps）", "G723")
+        self.input_audio_codec.addItem("AAC-LC", "AAC")
+        self.input_audio_codec.setToolTip(
+            "可随时选择音频编码；仅在勾选“开启音频推流”后，所选编码才会用于推流。"
+            "当前随包 FFmpeg 不支持 G.729、G.722.1 与 SVAC 音频编码。"
+        )
 
         self.input_audio = QComboBox()
         setup_combobox_popup(self.input_audio)
         self.input_audio.addItems(audio_names)
         self.input_audio.setEnabled(False)
+
+        self.check_talk = QCheckBox("启用语音对讲（G.711 双向 RTP）")
+        self.check_talk.setStyleSheet("QCheckBox { color: #FBBF24; }")
+        self.check_talk.setChecked(False)
+        self.check_talk.setToolTip(
+            "收到平台 s=Talk 的 INVITE 后，播放平台音频并将麦克风音频回传。"
+            "对讲启用时需要 Mac 麦克风权限。"
+        )
+        self.check_talk.stateChanged.connect(self.on_talk_toggled)
+
+        self.input_talk_codec = QComboBox()
+        setup_combobox_popup(self.input_talk_codec)
+        self.input_talk_codec.addItem("G.711 A-Law（推荐）", "G711A")
+        self.input_talk_codec.addItem("G.711 μ-Law", "G711U")
+        self.input_talk_codec.setToolTip("对讲当前仅支持 G.711 A-law / μ-law，保证 RTP 静态负载类型互通。")
+        self.input_talk_codec.setEnabled(False)
 
         basic_layout.addRow("服务器 IP:", self.input_server_ip)
         basic_layout.addRow("服务器端口:", self.input_server_port)
@@ -1042,6 +1113,7 @@ class EasyGBDMacGUI(QMainWindow):
         basic_layout.addRow("本地端口:", self.input_local_port)
         basic_layout.addRow("设备国标 ID:", self.input_device_id)
         basic_layout.addRow("通道国标 ID:", self.input_channel_id)
+        basic_layout.addRow("设备模拟协议:", self.input_gb28181_version)
         basic_layout.addRow("注册密码:", self.pwd_container)
         basic_layout.addRow("视频源摄像头:", self.input_camera)
         basic_layout.addRow("", self.custom_url_container)
@@ -1049,9 +1121,13 @@ class EasyGBDMacGUI(QMainWindow):
         basic_layout.addRow("推流分辨率:", self.input_video_resolution)
         basic_layout.addRow("推流帧率 (fps):", self.input_video_fps)
         basic_layout.addRow("推流码率 (kbps):", self.input_video_bitrate)
+        basic_layout.addRow("视频编码:", self.input_video_codec)
         basic_layout.addRow("", self.check_mirror)
         basic_layout.addRow("", self.check_audio)
+        basic_layout.addRow("音频编码:", self.input_audio_codec)
         basic_layout.addRow("麦克风设备:", self.input_audio)
+        basic_layout.addRow("", self.check_talk)
+        basic_layout.addRow("对讲音频编码:", self.input_talk_codec)
 
         self.check_auto_recovery = QCheckBox("网络变更自动切换IP并重新注册")
         self.check_auto_recovery.setStyleSheet("QCheckBox { color: #818CF8; font-weight: 600; }")
@@ -1444,13 +1520,14 @@ class EasyGBDMacGUI(QMainWindow):
         self.all_input_widgets = [
             self.input_server_ip, self.input_server_port, self.input_server_id,
             self.input_local_ip, self.input_local_port, self.input_device_id,
-            self.input_channel_id, self.input_password, self.input_camera,
+            self.input_channel_id, self.input_gb28181_version, self.input_password, self.input_camera,
             self.input_custom_url, self.btn_select_local_file,
             self.combo_preset,
             self.input_video_resolution, self.input_video_fps,
-            self.input_video_bitrate,
+            self.input_video_bitrate, self.input_video_codec,
             self.check_mirror,
-            self.check_audio, self.input_audio,
+            self.check_audio, self.input_audio_codec, self.input_audio,
+            self.check_talk, self.input_talk_codec,
             self.input_device_name, self.input_manufacturer, self.input_model,
             self.input_civil_code, self.input_address, self.input_owner,
             self.input_heartbeat_interval, self.input_expire_time,
@@ -1551,11 +1628,19 @@ class EasyGBDMacGUI(QMainWindow):
         if not self.channel_configs:
             self.init_default_channels()
         idx = max(0, min(self.current_channel_index, len(self.channel_configs) - 1))
+        # 首通道与基础区共用来源控件；其余通道必须以“多通道”区域自身的控件为准，
+        # 否则切换通道时会把尚未同步的独立来源误覆盖为通道 1 的来源。
+        if idx == 0:
+            source_text = self.input_camera.currentText()
+            custom_url = self.input_custom_url.text().strip()
+        else:
+            source_text = self.input_channel_source.currentText()
+            custom_url = self.input_channel_custom_url.text().strip()
         self.channel_configs[idx].update({
             "channel_id": self.input_channel_id.text().strip(),
             "name": self.input_channel_name.text().strip() or f"通道{idx + 1}",
-            "camera_source_text": self.input_camera.currentText(),
-            "custom_url": self.input_custom_url.text().strip(),
+            "camera_source_text": source_text,
+            "custom_url": custom_url,
         })
         self.refresh_channel_combo()
 
@@ -1666,6 +1751,16 @@ class EasyGBDMacGUI(QMainWindow):
         self.load_presets()
         self.append_log(f"[系统] 已删除配置预设: {name}")
 
+    @staticmethod
+    def _set_combo_data(combo, value, default_value=None):
+        """优先按稳定的 userData 恢复下拉项，兼容旧预设缺少新增字段。"""
+        target = str(value if value is not None else default_value)
+        index = combo.findData(target)
+        if index < 0 and default_value is not None:
+            index = combo.findData(str(default_value))
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
     def apply_config_data(self, data):
         self.input_server_ip.setEditText(data.get("server_ip", self.input_server_ip.currentText()))
         self.input_server_port.setText(str(data.get("server_port", self.input_server_port.text())))
@@ -1673,14 +1768,19 @@ class EasyGBDMacGUI(QMainWindow):
         self.input_local_ip.setEditText(data.get("local_ip", self.input_local_ip.currentText()))
         self.input_local_port.setText(str(data.get("local_port", self.input_local_port.text())))
         self.input_device_id.setText(data.get("device_id", self.input_device_id.text()))
+        self._set_combo_data(self.input_gb28181_version, data.get("gb28181_version", "2016"), "2016")
         self.input_password.setText(data.get("password", self.input_password.text()))
         self.input_heartbeat_interval.setText(str(data.get("heartbeat_interval", self.input_heartbeat_interval.text())))
         self.input_expire_time.setText(str(data.get("expire_time", self.input_expire_time.text())))
         self.input_video_resolution.setCurrentText(data.get("video_resolution", self.input_video_resolution.currentText()))
         self.input_video_fps.setCurrentText(str(data.get("video_fps", self.input_video_fps.currentText())))
         self.input_video_bitrate.setCurrentText(str(data.get("video_bitrate", self.input_video_bitrate.currentText())))
+        self._set_combo_data(self.input_video_codec, data.get("video_codec", "H264"), "H264")
         self.check_mirror.setChecked(bool(data.get("video_mirror", self.check_mirror.isChecked())))
+        self._set_combo_data(self.input_audio_codec, data.get("audio_codec", "G711A"), "G711A")
         self.check_audio.setChecked(bool(data.get("audio_enabled", self.check_audio.isChecked())))
+        self._set_combo_data(self.input_talk_codec, data.get("talk_codec", "G711A"), "G711A")
+        self.check_talk.setChecked(bool(data.get("talk_enabled", self.check_talk.isChecked())))
         self.input_device_name.setText(data.get("device_name", self.input_device_name.text()))
         self.input_manufacturer.setText(data.get("manufacturer", self.input_manufacturer.text()))
         self.input_model.setText(data.get("model", self.input_model.text()))
@@ -1759,7 +1859,29 @@ class EasyGBDMacGUI(QMainWindow):
             elif status == Qt.PermissionStatus.Denied:
                 self.append_log("[警告] macOS 未授权麦克风访问，请在“系统设置 → 隐私与安全性 → 麦克风”中允许 OpenGBD。")
             else:
-                self.append_log("[系统] 音频推流已启用 (G.711 A-Law / 8kHz / 单声道)")
+                self.append_log(
+                    f"[系统] 音频推流已启用 ({self.input_audio_codec.currentText()})"
+                )
+
+    def on_talk_toggled(self, state):
+        enabled = self.check_talk.isChecked()
+        self.input_talk_codec.setEnabled(enabled)
+        if not enabled:
+            return
+
+        perm = QMicrophonePermission()
+        status = QApplication.instance().checkPermission(perm)
+        if status == Qt.PermissionStatus.Undetermined:
+            self.append_log("[Talk] 正在请求 macOS 麦克风权限以启用语音对讲...")
+            QApplication.instance().requestPermission(
+                perm,
+                self,
+                lambda result: self.on_microphone_permission_result(result)
+            )
+        elif status == Qt.PermissionStatus.Denied:
+            self.append_log("[Talk 警告] macOS 未授权麦克风访问，语音对讲无法回传本机声音。")
+        else:
+            self.append_log(f"[Talk] 语音对讲已启用（{self.input_talk_codec.currentText()}）。")
 
     def on_microphone_permission_result(self, permission):
         if permission.status() == Qt.PermissionStatus.Granted:
@@ -1925,6 +2047,7 @@ class EasyGBDMacGUI(QMainWindow):
             'local_ip': self.input_local_ip.currentText().strip(),
             'local_port': self.input_local_port.text().strip(),
             'device_id': self.input_device_id.text().strip(),
+            'gb28181_version': self.input_gb28181_version.currentData() or '2016',
             'channel_id': primary_channel.get('channel_id', self.input_channel_id.text().strip()),
             'password': self.input_password.text().strip(),
             'heartbeat_interval': self.input_heartbeat_interval.text().strip() or '60',
@@ -1937,11 +2060,15 @@ class EasyGBDMacGUI(QMainWindow):
             'video_resolution': self.input_video_resolution.currentText().strip() or '640x480',
             'video_fps': self.input_video_fps.currentText().strip() or '30',
             'video_bitrate': self.input_video_bitrate.currentText().strip() or '1000',
+            'video_codec': self.input_video_codec.currentData() or 'H264',
             'video_mirror': self.check_mirror.isChecked(),
             'audio_enabled': self.check_audio.isChecked(),
+            'audio_codec': self.input_audio_codec.currentData() or 'G711A',
             'audio_source_idx': max(0, self.input_audio.currentIndex() - 1) if self.input_audio.currentIndex() > 0 else 0,
             'audio_source_text': self.input_audio.currentText(),
             'audio_devices_list': [dev.description() for dev in self.audio_devices],
+            'talk_enabled': self.check_talk.isChecked(),
+            'talk_codec': self.input_talk_codec.currentData() or 'G711A',
             'local_preview_port': 23000,
             'ptz_pan': self.ptz_pan,
             'ptz_tilt': self.ptz_tilt,
@@ -1958,6 +2085,10 @@ class EasyGBDMacGUI(QMainWindow):
         for w in self.all_input_widgets + [self.btn_toggle_pwd]:
             if w in [self.input_video_resolution, self.input_video_fps, self.input_video_bitrate]:
                 w.setEnabled(enabled and ("自定义" in self.combo_preset.currentText()))
+            elif w is self.input_audio:
+                w.setEnabled(enabled and self.check_audio.isChecked())
+            elif w is self.input_talk_codec:
+                w.setEnabled(enabled and self.check_talk.isChecked())
             else:
                 w.setEnabled(enabled)
 
@@ -2016,7 +2147,7 @@ class EasyGBDMacGUI(QMainWindow):
 
         device = self.thread.device if self.thread and self.thread.device else None
         if device and getattr(device, "media_state", "IDLE") in ("STARTING", "STREAMING"):
-            running = device.media_ctrl.is_streaming()
+            running = device.is_streaming()
             if woke_from_sleep or not running:
                 reason = (
                     "检测到电脑休眠/唤醒，平台点播推流已中断，请在平台重新点播。"
@@ -2229,7 +2360,6 @@ class EasyGBDMacGUI(QMainWindow):
                 pass
             self.thread.stop()
             self.thread = None
-        MediaController.kill_bundled_ffmpeg_processes(log_signaler.log_signal.emit)
 
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -2731,7 +2861,6 @@ class EasyGBDMacGUI(QMainWindow):
         if self.manual_media_ctrl:
             self.manual_media_ctrl.stop_stream()
             self.manual_media_ctrl = None
-        MediaController.kill_bundled_ffmpeg_processes(log_signaler.log_signal.emit)
         self.is_manual_pushing = False
         self.set_stream_status("IDLE", "手动测试推流已停止，当前未推流")
         self._restore_camera_preview_after_stream()
@@ -2821,7 +2950,7 @@ class EasyGBDMacGUI(QMainWindow):
         self.multi_combo_source.addItems([
             "【虚拟源】测试彩条信号 (推荐)",
             "【自定义源】RTSP/MP4文件",
-            "【摄像头】本机默认摄像头"
+            "【摄像头】本机默认摄像头（仅单台）"
         ])
         gen_row.addWidget(self.multi_combo_source)
 
@@ -2966,27 +3095,88 @@ class EasyGBDMacGUI(QMainWindow):
             return f"{prefix}{new_num:0{len(num_part)}d}"
         return f"{code_str}_{offset}"
 
+    def _next_available_multi_port(self, start_port, existing_ports):
+        port = int(start_port)
+        while port in existing_ports and port <= 65535:
+            port += 1
+        return port if port <= 65535 else None
+
+    def _next_unique_multi_id(self, start_id, offset, existing_ids):
+        candidate_offset = int(offset)
+        while True:
+            candidate = self._increment_gb_code(start_id, candidate_offset)
+            if candidate not in existing_ids:
+                return candidate
+            candidate_offset += 1
+
+    @staticmethod
+    def _is_cluster_camera_source(source_text):
+        return "【摄像头】" in str(source_text)
+
+    def _validate_multi_cluster(self):
+        errors = []
+        try:
+            server_port = int(self.multi_input_server_port.text().strip())
+            if not 1 <= server_port <= 65535:
+                errors.append("平台 SIP 端口必须在 1–65535 之间")
+        except ValueError:
+            errors.append("平台 SIP 端口必须是数字")
+
+        for field_name, key in (("本地端口", "port"), ("设备国标 ID", "device_id"), ("通道国标 ID", "channel_id")):
+            values = [str(device.get(key, "")).strip() for device in self.multi_devices]
+            if any(not value for value in values):
+                errors.append(f"存在空的{field_name}")
+            duplicates = sorted({value for value in values if values.count(value) > 1})
+            if duplicates:
+                errors.append(f"{field_name}重复：{', '.join(duplicates[:3])}")
+
+        camera_devices = [device for device in self.multi_devices if self._is_cluster_camera_source(device.get("source"))]
+        if len(camera_devices) > 1:
+            errors.append("集群中多个设备不能共用本机摄像头；请改为彩条或可并发访问的 RTSP/文件源")
+
+        if self.thread is not None and self.thread.device:
+            single_port = self.input_local_port.text().strip()
+            if any(str(device.get("port")) == single_port for device in self.multi_devices):
+                errors.append(f"集群本地端口与单设备调试端口冲突：{single_port}")
+            single_id = self.input_device_id.text().strip()
+            if single_id and any(device.get("device_id") == single_id for device in self.multi_devices):
+                errors.append(f"集群设备国标 ID 与单设备调试冲突：{single_id}")
+
+        return errors
+
     def on_multi_batch_generate(self):
         start_port = self.multi_input_start_port.value()
         start_dev_id = self.multi_input_start_device_id.text().strip() or "34020000001110000001"
         start_ch_id = self.multi_input_start_channel_id.text().strip() or "34020000001320000001"
         count = self.multi_input_count.value()
         source_text = self.multi_combo_source.currentText()
+
+        if self._is_cluster_camera_source(source_text) and count > 1:
+            QMessageBox.warning(
+                self, "不能批量使用摄像头",
+                "一块本机摄像头不能被多台模拟设备可靠地并发占用。请使用彩条、RTSP 或本地文件源；摄像头模式仅允许单台设备。"
+            )
+            return
         
         custom_url = self.input_custom_url.text().strip() if hasattr(self, 'input_custom_url') else "rtsp://127.0.0.1:8554/live"
 
         existing_ports = {d["port"] for d in self.multi_devices}
+        existing_device_ids = {d["device_id"] for d in self.multi_devices}
+        existing_channel_ids = {d["channel_id"] for d in self.multi_devices}
 
         for i in range(count):
-            port = start_port + i
-            while port in existing_ports:
-                port += 1
+            port = self._next_available_multi_port(start_port + i, existing_ports)
+            if port is None:
+                QMessageBox.warning(self, "端口不足", "没有可用的 UDP 本地端口可供继续生成设备。")
+                break
             existing_ports.add(port)
 
             self.multi_device_counter += 1
             idx_name = f"模拟设备-{self.multi_device_counter:02d}"
-            dev_id = self._increment_gb_code(start_dev_id, i)
-            ch_id = self._increment_gb_code(start_ch_id, i)
+            dev_id = self._next_unique_multi_id(start_dev_id, i, existing_device_ids)
+            ch_id = self._next_unique_multi_id(start_ch_id, i, existing_channel_ids)
+            existing_device_ids.add(dev_id)
+            existing_channel_ids.add(ch_id)
 
             dev_dict = {
                 "uid": f"dev_{self.multi_device_counter}_{int(time.time()*1000)}",
@@ -3004,27 +3194,36 @@ class EasyGBDMacGUI(QMainWindow):
 
         self.refresh_multi_device_table()
         self.update_multi_kpi_summary()
-        self.append_log(f"[集群] 成功批量生成 {count} 台模拟设备，当前集群共 {len(self.multi_devices)} 台。")
+        self.append_log(f"[集群] 已批量生成设备，当前集群共 {len(self.multi_devices)} 台（端口与国标 ID 已去重）。")
 
     def on_multi_add_single(self):
         start_port = self.multi_input_start_port.value()
         existing_ports = {d["port"] for d in self.multi_devices}
-        port = start_port + len(self.multi_devices)
-        while port in existing_ports:
-            port += 1
+        source_text = self.multi_combo_source.currentText()
+        if self._is_cluster_camera_source(source_text) and any(
+            self._is_cluster_camera_source(device.get("source")) for device in self.multi_devices
+        ):
+            QMessageBox.warning(self, "摄像头已被集群占用", "集群只允许一台设备使用本机摄像头，请为新增设备选择彩条、RTSP 或本地文件源。")
+            return
+        port = self._next_available_multi_port(start_port + len(self.multi_devices), existing_ports)
+        if port is None:
+            QMessageBox.warning(self, "端口不足", "没有可用的 UDP 本地端口可供添加设备。")
+            return
 
         self.multi_device_counter += 1
         idx = len(self.multi_devices)
         start_dev_id = self.multi_input_start_device_id.text().strip() or "34020000001110000001"
         start_ch_id = self.multi_input_start_channel_id.text().strip() or "34020000001320000001"
+        existing_device_ids = {d["device_id"] for d in self.multi_devices}
+        existing_channel_ids = {d["channel_id"] for d in self.multi_devices}
 
         dev_dict = {
             "uid": f"dev_{self.multi_device_counter}_{int(time.time()*1000)}",
             "name": f"模拟设备-{self.multi_device_counter:02d}",
             "port": port,
-            "device_id": self._increment_gb_code(start_dev_id, idx),
-            "channel_id": self._increment_gb_code(start_ch_id, idx),
-            "source": self.multi_combo_source.currentText(),
+            "device_id": self._next_unique_multi_id(start_dev_id, idx, existing_device_ids),
+            "channel_id": self._next_unique_multi_id(start_ch_id, idx, existing_channel_ids),
+            "source": source_text,
             "custom_url": self.input_custom_url.text().strip() if hasattr(self, 'input_custom_url') else "rtsp://127.0.0.1:8554/live",
             "thread": None,
             "reg_state": "IDLE",
@@ -3158,29 +3357,34 @@ class EasyGBDMacGUI(QMainWindow):
         local_ip = best_local_ip_for_server(server_ip, local_ips)
 
         return {
-            "SIP_SERVER_IP": server_ip,
-            "SIP_SERVER_PORT": int(self.multi_input_server_port.text().strip() or "5060"),
-            "SIP_SERVER_ID": self.multi_input_server_id.text().strip() or "34020000002000000001",
-            "LOCAL_IP": local_ip,
-            "LOCAL_PORT": int(dev["port"]),
-            "DEVICE_ID": dev["device_id"],
-            "CHANNEL_ID": dev["channel_id"],
-            "PASSWORD": self.multi_input_password.text().strip() or "12345",
+            "server_ip": server_ip,
+            "server_port": self.multi_input_server_port.text().strip() or "5060",
+            "server_id": self.multi_input_server_id.text().strip() or "34020000002000000001",
+            "local_ip": local_ip,
+            "local_port": str(dev["port"]),
+            "device_id": dev["device_id"],
+            "channel_id": dev["channel_id"],
+            "password": self.multi_input_password.text().strip() or "12345",
             "camera_source_text": dev["source"],
             "custom_url": dev.get("custom_url", ""),
             "video_resolution": "1920x1080",
             "video_fps": "25",
             "video_bitrate": "2048",
-            "enable_audio": False,
+            "video_codec": self.input_video_codec.currentData() or "H264",
+            "audio_enabled": False,
+            "audio_codec": self.input_audio_codec.currentData() or "G711A",
             "audio_source_text": "默认音频输入",
+            "talk_enabled": False,
+            "talk_codec": self.input_talk_codec.currentData() or "G711A",
+            "gb28181_version": self.input_gb28181_version.currentData() or "2016",
             "device_name": dev["name"],
             "manufacturer": "AntigravitySim",
             "model": "GB28181-SimCluster",
             "civil_code": "310115",
             "address": "Shanghai-Lab",
             "owner": "COMAC",
-            "HEARTBEAT_INTERVAL": 15,
-            "EXPIRE_TIME": 3600,
+            "heartbeat_interval": "15",
+            "expire_time": "3600",
             "channels": [{
                 "channel_id": dev["channel_id"],
                 "name": dev["name"],
@@ -3244,18 +3448,32 @@ class EasyGBDMacGUI(QMainWindow):
         self.update_multi_kpi_summary()
 
     def on_multi_start_all(self):
-        self.append_log(f"[集群] 正在一键启动集群全部 {len(self.multi_devices)} 台设备...")
-        for dev in self.multi_devices:
-            if dev["thread"] is None:
-                self.start_single_multi_device(dev["uid"])
-                time.sleep(0.08)  # 平滑错开注册，防止并发洪峰
+        errors = self._validate_multi_cluster()
+        if errors:
+            detail = "\n".join(f"• {error}" for error in errors)
+            self.append_log(f"[集群 错误] 启动前校验未通过：{'; '.join(errors)}")
+            QMessageBox.warning(self, "集群启动前校验未通过", detail)
+            return
+        self._multi_start_queue = [
+            dev["uid"] for dev in self.multi_devices if dev["thread"] is None
+        ]
+        self.append_log(f"[集群] 正在一键启动 {len(self._multi_start_queue)} 台设备，将以 80ms 间隔错峰注册...")
+        self._start_next_multi_device()
+
+    def _start_next_multi_device(self):
+        if not self._multi_start_queue:
+            return
+        uid = self._multi_start_queue.pop(0)
+        self.start_single_multi_device(uid)
+        if self._multi_start_queue:
+            QTimer.singleShot(80, self._start_next_multi_device)
 
     def on_multi_stop_all(self):
+        self._multi_start_queue = []
         self.append_log("[集群] 正在停止集群中所有设备...")
         for dev in self.multi_devices:
             if dev["thread"] is not None:
                 self.stop_single_multi_device(dev["uid"])
-        MediaController.kill_bundled_ffmpeg_processes(log_signaler.log_signal.emit)
 
     def on_multi_reg_state_changed(self, uid, state, msg):
         dev = next((d for d in self.multi_devices if d["uid"] == uid), None)

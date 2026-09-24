@@ -10,13 +10,32 @@ def _rand_token(n=8):
     """生成纯字母数字随机token，用于 branch / tag 等不允许含 '@' 的 SIP 参数"""
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
+def _user_agent(config):
+    """在 SIP 标识中声明当前设备模拟的国标版本，便于平台侧排障。"""
+    manufacturer = getattr(config, 'MANUFACTURER', 'OpenGBD')
+    version = '2022' if '2022' in str(getattr(config, 'GB28181_VERSION', '2016')) else '2016'
+    return f"{manufacturer} GB28181-{version}"
+
 def get_md5(text):
     return hashlib.md5(text.encode('utf-8')).hexdigest()
 
-def generate_auth_response(username, password, realm, nonce, uri, method="REGISTER"):
-    ha1 = get_md5(f"{username}:{realm}:{password}")
-    ha2 = get_md5(f"{method}:{uri}")
-    response = get_md5(f"{ha1}:{nonce}:{ha2}")
+def normalize_digest_algorithm(algorithm):
+    """标准化 SIP Digest 算法名称，仅接受本工具已实现的安全算法。"""
+    value = str(algorithm or "MD5").strip().upper().replace("_", "-")
+    return "SHA-256" if value in ("SHA-256", "SHA256") else "MD5"
+
+def get_digest_hash(text, algorithm="MD5"):
+    normalized = normalize_digest_algorithm(algorithm)
+    if normalized == "SHA-256":
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+    return get_md5(text)
+
+def generate_auth_response(username, password, realm, nonce, uri, method="REGISTER", algorithm="MD5"):
+    """生成不含 qop 的 RFC 2617 / SIP Digest 响应，支持 MD5 与 SHA-256。"""
+    normalized = normalize_digest_algorithm(algorithm)
+    ha1 = get_digest_hash(f"{username}:{realm}:{password}", normalized)
+    ha2 = get_digest_hash(f"{method}:{uri}", normalized)
+    response = get_digest_hash(f"{ha1}:{nonce}:{ha2}", normalized)
     return response
 
 def build_register_msg(config, cseq, call_id, auth_header=None, expires=None):
@@ -33,7 +52,7 @@ def build_register_msg(config, cseq, call_id, auth_header=None, expires=None):
     msg += f"CSeq: {cseq} REGISTER\r\n"
     msg += f"Contact: <{contact_uri}>\r\n"
     msg += f"Max-Forwards: 70\r\n"
-    msg += f"User-Agent: {config.MANUFACTURER}\r\n"
+    msg += f"User-Agent: {_user_agent(config)}\r\n"
     
     expires_val = expires if expires is not None else getattr(config, 'EXPIRE_TIME', 3600)
     msg += f"Expires: {expires_val}\r\n"
@@ -74,7 +93,7 @@ def build_device_info_msg(config, cseq, call_id, sn=None):
     msg += f"CSeq: {cseq} MESSAGE\r\n"
     msg += "Content-Type: Application/MANSCDP+xml\r\n"
     msg += f"Max-Forwards: 70\r\n"
-    msg += f"User-Agent: {getattr(config, 'MANUFACTURER', 'OpenGBD')}\r\n"
+    msg += f"User-Agent: {_user_agent(config)}\r\n"
     msg += f"Content-Length: {len(xml_bytes)}\r\n\r\n"
     msg += xml_body
     return msg
@@ -102,7 +121,7 @@ def build_keepalive_msg(config, cseq, call_id):
     msg += f"CSeq: {cseq} MESSAGE\r\n"
     msg += "Content-Type: Application/MANSCDP+xml\r\n"
     msg += f"Max-Forwards: 70\r\n"
-    msg += f"User-Agent: {config.MANUFACTURER}\r\n"
+    msg += f"User-Agent: {_user_agent(config)}\r\n"
     msg += f"Content-Length: {len(xml_body.encode(XML_ENCODING))}\r\n\r\n"
     msg += xml_body
     return msg
@@ -155,7 +174,7 @@ def build_catalog_response_msg(config, sn, cseq, call_id):
     msg += f"CSeq: {cseq} MESSAGE\r\n"
     msg += "Content-Type: Application/MANSCDP+xml\r\n"
     msg += f"Max-Forwards: 70\r\n"
-    msg += f"User-Agent: {config.MANUFACTURER}\r\n"
+    msg += f"User-Agent: {_user_agent(config)}\r\n"
     msg += f"Content-Length: {len(xml_body.encode(XML_ENCODING))}\r\n\r\n"
     msg += xml_body
     return msg

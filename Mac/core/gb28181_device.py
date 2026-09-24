@@ -3,6 +3,7 @@ import threading
 import time
 import re
 import random
+import copy
 
 from core import sip_stack
 from core.media_control import MediaController
@@ -39,12 +40,16 @@ class GB28181Device:
         self.media_ctrl.preview_url_callback = media_preview_callback
         self.call_id = self.config.generate_call_id()
         self._active_invite_callid = None  # 防止 INVITE 重传轰炸
+        self._active_talk_callid = None
+        # 每个点播 Call-ID 保持独立 FFmpeg 会话，单设备的多个 Catalog 通道可并发推流。
+        self._active_streams = {}
         self.registration_state = "IDLE"
         self.registration_error = ""
         self._registration_deadline = None
         self._auth_attempted = False
         self._auth_realm = None
         self._auth_nonce = None
+        self._auth_algorithm = "MD5"
         self._stopping = False
         
         # 异常重试与断线重连控制
@@ -91,12 +96,93 @@ class GB28181Device:
         match = re.match(r'INVITE\s+sip:([^@;\s>]+)', first_line, re.IGNORECASE)
         return match.group(1).strip() if match else ""
 
+    @staticmethod
+    def _sdp_session_name(sdp_body):
+        for raw_line in sdp_body.splitlines():
+            line = raw_line.strip()
+            if line.lower().startswith("s="):
+                return line[2:].strip().lower()
+        return ""
+
+    @staticmethod
+    def _allocate_udp_port(local_ip):
+        """为 RTP 接收端选择可用临时端口；实际绑定由 FFmpeg 完成。"""
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.bind((local_ip or "0.0.0.0", 0))
+            return probe.getsockname()[1]
+        finally:
+            probe.close()
+
+    def _send_invite_response(self, parsed_msg, status, reason, sdp_body=""):
+        headers = parsed_msg.get("headers", {})
+        to_hdr = headers.get("To", "")
+        if status == 200 and ";tag=" not in to_hdr:
+            to_hdr = f"{to_hdr};tag={''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))}"
+        response = f"SIP/2.0 {status} {reason}\r\n"
+        response += f"Via: {headers.get('Via', '')}\r\n"
+        response += f"From: {headers.get('From', '')}\r\n"
+        response += f"To: {to_hdr}\r\n"
+        response += f"Call-ID: {headers.get('Call-ID', '')}\r\n"
+        response += f"CSeq: {headers.get('CSeq', '')}\r\n"
+        if status == 200:
+            contact_uri = f"sip:{self.config.DEVICE_ID}@{self.config.LOCAL_IP}:{self.config.LOCAL_PORT}"
+            response += f"Contact: <{contact_uri}>\r\n"
+        if sdp_body:
+            response += "Content-Type: application/sdp\r\n"
+            response += f"Content-Length: {len(sdp_body.encode('utf-8'))}\r\n\r\n{sdp_body}"
+        else:
+            response += "Content-Length: 0\r\n\r\n"
+        self.send_msg(response)
+        return response
+
+    def _make_channel_media_controller(self, channel):
+        """为一个被点播的 Catalog 通道创建独立媒体控制器，避免通道之间互相停流。"""
+        media_config = copy.copy(self.config)
+        media_config.apply_channel_config(channel)
+        media_config.ptz_pan = self.ptz_pan
+        media_config.ptz_tilt = self.ptz_tilt
+        media_config.ptz_zoom = self.ptz_zoom
+        controller = MediaController(media_config)
+        controller.media_ctrl_print = self.log
+        controller.preview_url_callback = self.media_ctrl.preview_url_callback
+        return controller
+
+    def is_streaming(self):
+        return any(
+            session["controller"].is_streaming()
+            for session in self._active_streams.values()
+        )
+
+    def active_stream_count(self):
+        return sum(
+            1 for session in self._active_streams.values()
+            if session["controller"].is_streaming()
+        )
+
+    def _stop_stream_session(self, call_id):
+        session = self._active_streams.pop(call_id, None)
+        if not session:
+            return False
+        session["controller"].stop_stream()
+        return True
+
+    def _stop_all_stream_sessions(self):
+        for call_id in list(self._active_streams):
+            self._stop_stream_session(call_id)
+
+    def _refresh_media_state(self, message=""):
+        active = self.active_stream_count()
+        if active:
+            self._set_media_state("STREAMING", message or f"{active} 路通道正在推流")
+        else:
+            self._set_media_state("IDLE", message or "当前未推流")
+
     def mark_media_interrupted(self, reason):
         if self.media_state not in ("STARTING", "STREAMING"):
             return
         self.log(f"[Media Error] 推流中断: {reason}")
-        self.media_ctrl.stop_stream()
-        MediaController.kill_bundled_ffmpeg_processes(self.log)
+        self._stop_all_stream_sessions()
         self._active_invite_callid = None
         self._set_media_state("ERROR", reason)
 
@@ -198,22 +284,34 @@ class GB28181Device:
         
         realm_match = re.search(r'realm="([^"]+)"', auth_header)
         nonce_match = re.search(r'nonce="([^"]+)"', auth_header)
+        algorithm_match = re.search(r'algorithm\s*=\s*"?([^,\s"]+)', auth_header, re.IGNORECASE)
         
         if realm_match and nonce_match:
             realm = realm_match.group(1)
             nonce = nonce_match.group(1)
             self._auth_realm = realm
             self._auth_nonce = nonce
+            self._auth_algorithm = sip_stack.normalize_digest_algorithm(
+                algorithm_match.group(1) if algorithm_match else "MD5"
+            )
             
             uri = f"sip:{self.config.SIP_SERVER_DOMAIN}@{self.config.SIP_SERVER_IP}:{self.config.SIP_SERVER_PORT}"
-            response = sip_stack.generate_auth_response(self.config.DEVICE_ID, self.config.PASSWORD, realm, nonce, uri)
+            response = sip_stack.generate_auth_response(
+                self.config.DEVICE_ID, self.config.PASSWORD, realm, nonce, uri,
+                algorithm=self._auth_algorithm
+            )
             
-            auth_response = f'Digest username="{self.config.DEVICE_ID}", realm="{realm}", nonce="{nonce}", uri="{uri}", response="{response}", algorithm=MD5'
+            auth_response = (
+                f'Digest username="{self.config.DEVICE_ID}", realm="{realm}", nonce="{nonce}", '
+                f'uri="{uri}", response="{response}", algorithm={self._auth_algorithm}'
+            )
             
             msg = sip_stack.build_register_msg(self.config, self.cseq, self.call_id, auth_header=auth_response)
             self._auth_attempted = True
             self._registration_deadline = time.monotonic() + self.REGISTRATION_TIMEOUT_SECONDS
-            self._set_registration_state("AUTHENTICATING", f"平台要求Digest认证（Realm: {realm}）")
+            self._set_registration_state(
+                "AUTHENTICATING", f"平台要求Digest认证（{self._auth_algorithm} / Realm: {realm}）"
+            )
             if not self.send_msg(msg):
                 self._schedule_registration_retry("认证注册请求发送失败，请检查网络连接")
             self.cseq += 1
@@ -296,7 +394,10 @@ class GB28181Device:
         self.config.ptz_pan = self.ptz_pan
         self.config.ptz_tilt = self.ptz_tilt
         self.config.ptz_zoom = self.ptz_zoom
+        # 一个设备下的所有通道共享同一模拟云台状态，因此同步重启每一路活跃媒体会话。
         self.media_ctrl.set_ptz_state(self.ptz_pan, self.ptz_tilt, self.ptz_zoom)
+        for session in list(self._active_streams.values()):
+            session["controller"].set_ptz_state(self.ptz_pan, self.ptz_tilt, self.ptz_zoom)
         if self.ptz_callback:
             self.ptz_callback(self.ptz_pan, self.ptz_tilt, self.ptz_zoom, source)
 
@@ -431,12 +532,91 @@ class GB28181Device:
 
             time.sleep(1)
 
+    def handle_talk_invite(self, parsed_msg):
+        """处理 GB/T 28181 Talk/Broadcast 音频会话，当前实现 G.711 双向 RTP。"""
+        call_id = parsed_msg['headers'].get('Call-ID', '')
+        if call_id == self._active_talk_callid:
+            self.log("[Talk] 忽略重复的语音对讲 INVITE。")
+            return
+        if not getattr(self.config, 'talk_enabled', False):
+            self.log("[Talk] 收到语音对讲请求，但本设备未启用语音对讲。")
+            self._send_invite_response(parsed_msg, 486, "Busy Here")
+            return
+        if self.media_ctrl.is_talking():
+            self.log("[Talk] 已存在语音对讲会话，拒绝新的 INVITE。")
+            self._send_invite_response(parsed_msg, 486, "Busy Here")
+            return
+        if self.is_streaming() and getattr(self.config, 'audio_enabled', False):
+            self.log("[Talk] 当前视频推流已占用麦克风，无法并发开启语音对讲。")
+            self._send_invite_response(parsed_msg, 486, "Busy Here")
+            return
+
+        offer = self.media_ctrl.parse_talk_sdp(parsed_msg.get('body', ''))
+        if not offer['ip'] or not offer['port'] or offer['transport'] != 'UDP':
+            self.log("[Talk] 对讲 SDP 缺少 UDP 音频地址/端口，拒绝会话。")
+            self._send_invite_response(parsed_msg, 488, "Not Acceptable Here")
+            return
+        configured_codec = getattr(self.config, 'TALK_CODEC', 'G711A')
+        configured_codec = self.media_ctrl._talk_codec_profile(configured_codec)['codec']
+        offered_codecs = offer.get('offered_codecs', [])
+        selected_offer = next(
+            (item for item in offered_codecs if item['codec'] == configured_codec), None
+        )
+        if not selected_offer:
+            offered_names = ', '.join(item['encoding'] for item in offered_codecs) or '未知'
+            self.log(
+                f"[Talk] 平台提供 {offered_names}，与本机对讲设置 {configured_codec} 不匹配，拒绝会话。"
+            )
+            self._send_invite_response(parsed_msg, 488, "Not Acceptable Here")
+            return
+
+        local_ip = get_local_ip_for_target(offer['ip']) or self.config.LOCAL_IP
+        try:
+            local_port = self._allocate_udp_port(local_ip)
+        except Exception as exc:
+            self.log(f"[Talk Error] 无法分配本地 RTP 端口: {exc}")
+            self._send_invite_response(parsed_msg, 500, "Server Internal Error")
+            return
+
+        codec = selected_offer['codec']
+        profile = self.media_ctrl._talk_codec_profile(codec)
+        answer_sdp = (
+            "v=0\r\n"
+            f"o={self.config.DEVICE_ID} 0 0 IN IP4 {local_ip}\r\n"
+            "s=Talk\r\n"
+            f"c=IN IP4 {local_ip}\r\n"
+            "t=0 0\r\n"
+            f"m=audio {local_port} RTP/AVP {profile['payload_type']}\r\n"
+            f"a=rtpmap:{profile['payload_type']} {profile['rtpmap']}\r\n"
+            "a=sendrecv\r\n"
+        )
+        started = self.media_ctrl.start_talk_session(
+            offer['ip'], offer['port'], local_ip, local_port, codec,
+            audio_device=getattr(self.config, 'audio_source_idx', 0)
+        )
+        if not started:
+            self._send_invite_response(parsed_msg, 500, "Server Internal Error")
+            return
+
+        self._active_talk_callid = call_id
+        self._send_invite_response(parsed_msg, 200, "OK", answer_sdp)
+        self.log(
+            f"[Talk] 已接受语音对讲：{codec} / 平台 {offer['ip']}:{offer['port']} / 本地 RTP {local_port}"
+        )
+
     def handle_invite(self, parsed_msg):
         call_id = parsed_msg['headers'].get('Call-ID', '')
 
-        # 防止 INVITE 重传轰炸：同一个 Call-ID 只处理一次
-        if call_id == self._active_invite_callid:
-            self.log("[SIP] Ignoring retransmitted INVITE (same Call-ID)")
+        # 每一路通道以 Call-ID 独立管理；重传不重复拉起 FFmpeg。
+        if call_id and call_id in self._active_streams:
+            # UDP 下 INVITE 重传是正常现象；必须重发同一份 200 OK，而不是
+            # 再启动 FFmpeg 或直接忽略，避免平台因丢失响应而误判点播失败。
+            saved_response = self._active_streams[call_id].get("invite_response")
+            if saved_response:
+                self.log("[SIP] Retransmitted INVITE detected; resending saved 200 OK.")
+                self.send_msg(saved_response)
+            else:
+                self.log("[SIP] Ignoring retransmitted INVITE (same Call-ID)")
             return
         self._active_invite_callid = call_id
 
@@ -444,22 +624,22 @@ class GB28181Device:
         self._set_media_state("STARTING", "平台已发起点播，正在启动推流")
         ip, port, protocol, ssrc = self.media_ctrl.parse_sdp(parsed_msg['body'])
         requested_channel_id = self._invite_target_id(parsed_msg.get('first_line', ''))
+        if requested_channel_id and not any(
+            str(item.get("channel_id", "")).strip() == requested_channel_id
+            for item in self.config.channels
+        ):
+            self.log(f"[GB28181] 平台点播了未在 Catalog 中声明的通道: {requested_channel_id}")
+            self._send_invite_response(parsed_msg, 404, "Not Found")
+            self._active_invite_callid = None
+            self._refresh_media_state()
+            return
         channel = self.config.get_channel(requested_channel_id)
-        self.config.apply_channel_config(channel)
+        media_controller = self._make_channel_media_controller(channel)
         self.log(
             f"[GB28181] 平台点播通道: requested={requested_channel_id or '-'}, "
-            f"using={self.config.CHANNEL_ID}, name={getattr(self.config, 'channel_name', '')}, "
-            f"source={getattr(self.config, 'camera_source_text', '')}"
+            f"using={channel.get('channel_id', '')}, name={channel.get('name', '')}, "
+            f"source={channel.get('camera_source_text', '')}"
         )
-        
-        cseq_val = parsed_msg['headers'].get('CSeq', '')
-        via = parsed_msg['headers'].get('Via', '')
-        from_hdr = parsed_msg['headers'].get('From', '')
-        to_hdr = parsed_msg['headers'].get('To', '')
-        
-        # 生成纯随机 tag（不含 @）
-        import string, random
-        to_tag = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
         # 动态探测连接流媒体目标 IP 时，Mac 使用的本地网卡 IP 接口，保证 SDP 里的 c= 属性值正确，以便 ZLM 正常接收 UDP 包
         media_local_ip = self.config.LOCAL_IP
@@ -470,8 +650,6 @@ class GB28181Device:
                     self.log(f"[SIP] 提示: 模拟器自动将 SDP 媒体连接 IP 从 {media_local_ip} 替换为真实局域网 IP {detected_ip}，以适配目标流媒体服务器 {ip}")
                 media_local_ip = detected_ip
 
-        contact_uri = f"sip:{self.config.DEVICE_ID}@{self.config.LOCAL_IP}:{self.config.LOCAL_PORT}"
-        
         sdp = f"""v=0
 o={self.config.DEVICE_ID} 0 0 IN IP4 {media_local_ip}
 s=Play
@@ -482,49 +660,51 @@ a=sendonly
 a=rtpmap:96 PS/90000
 y={ssrc}
 """
-        
-        resp = f"SIP/2.0 200 OK\r\n"
-        resp += f"Via: {via}\r\n"
-        resp += f"From: {from_hdr}\r\n"
-        if ";tag=" not in to_hdr:
-            resp += f"To: {to_hdr};tag={to_tag}\r\n"
-        else:
-            resp += f"To: {to_hdr}\r\n"
-        resp += f"Call-ID: {call_id}\r\n"
-        resp += f"CSeq: {cseq_val}\r\n"
-        resp += f"Contact: <{contact_uri}>\r\n"
-        resp += "Content-Type: application/sdp\r\n"
-        resp += f"Content-Length: {len(sdp)}\r\n\r\n"
-        resp += sdp
-        
-        self.send_msg(resp)
-        
-        if ip and port:
-            self.log(f"[Media] Instructed to stream to {ip}:{port} via {protocol}")
-            # 先让 GUI 释放 QCamera，再由 FFmpeg 独占摄像头并输出同源预览。
-            time.sleep(0.35)
-            if self.media_ctrl.start_stream(ip, port, protocol, ssrc):
-                self._set_media_state(
-                    "STREAMING",
-                    f"平台点播推流中：{ip}:{port} / {protocol} / SSRC {ssrc}"
-                )
-            else:
-                self._active_invite_callid = None
-                self._set_media_state("ERROR", "FFmpeg 启动失败，平台点播未形成有效推流")
-        else:
+        if not (ip and port and ssrc):
             self._set_media_state("ERROR", "平台点播 SDP 中缺少媒体地址或端口")
+            self._send_invite_response(parsed_msg, 488, "Not Acceptable Here")
+            self._active_invite_callid = None
+            return
+
+        self.log(f"[Media] Instructed to stream to {ip}:{port} via {protocol}")
+        # 先让 GUI 释放 QCamera，再由 FFmpeg 独占摄像头；仅确认 FFmpeg 存活后才返回 200 OK。
+        time.sleep(0.35)
+        if not media_controller.start_stream(ip, port, protocol, ssrc):
+            self._active_invite_callid = None
+            self._set_media_state("ERROR", "FFmpeg 启动失败，平台点播未形成有效推流")
+            self._send_invite_response(parsed_msg, 500, "Server Internal Error")
+            return
+
+        stream_key = call_id or f"stream-{self.cseq}-{time.monotonic_ns()}"
+        invite_response = self._send_invite_response(parsed_msg, 200, "OK", sdp)
+        self._active_streams[stream_key] = {
+            "controller": media_controller,
+            "channel_id": channel.get("channel_id", ""),
+            "channel_name": channel.get("name", ""),
+            "invite_response": invite_response,
+        }
+        self._refresh_media_state(
+            f"{self.active_stream_count()} 路通道正在推流（最新：{channel.get('channel_id', '')} -> {ip}:{port}）"
+        )
 
     def handle_bye(self, parsed_msg):
-        self.log("[SIP] Received BYE, stopping media...")
-        self.media_ctrl.stop_stream()
-        MediaController.kill_bundled_ffmpeg_processes(self.log)
-        self._set_media_state("IDLE", "平台已停止点播，当前未推流")
-        self._active_invite_callid = None  # 允许后续新的 INVITE
+        call_id = parsed_msg['headers'].get('Call-ID', '')
+        is_talk_bye = bool(call_id and call_id == self._active_talk_callid)
+        if is_talk_bye:
+            self.log("[Talk] Received BYE, stopping voice talk...")
+            self.media_ctrl.stop_talk_session()
+            self._active_talk_callid = None
+        else:
+            if self._stop_stream_session(call_id):
+                self.log(f"[SIP] Received BYE, stopped media session: {call_id}")
+            else:
+                self.log(f"[SIP] Received BYE for unknown media session: {call_id}")
+            self._active_invite_callid = None
+            self._refresh_media_state("平台已停止一路点播" if self.is_streaming() else "平台已停止点播，当前未推流")
         
         via = parsed_msg['headers'].get('Via', '')
         from_hdr = parsed_msg['headers'].get('From', '')
         to_hdr = parsed_msg['headers'].get('To', '')
-        call_id = parsed_msg['headers'].get('Call-ID', '')
         cseq_val = parsed_msg['headers'].get('CSeq', '')
         
         resp = f"SIP/2.0 200 OK\r\n"
@@ -570,7 +750,11 @@ y={ssrc}
                         # 收到心跳响应，清零丢失计数
                         self._missed_heartbeats = 0
                 elif first_line.startswith("INVITE"):
-                    self.handle_invite(parsed)
+                    session_name = self._sdp_session_name(parsed.get('body', ''))
+                    if session_name in ("talk", "broadcast"):
+                        self.handle_talk_invite(parsed)
+                    else:
+                        self.handle_invite(parsed)
                 elif first_line.startswith("BYE"):
                     self.handle_bye(parsed)
                 elif first_line.startswith("MESSAGE"):
@@ -637,16 +821,50 @@ y={ssrc}
 
     def start(self):
         """启动设备：绑定端口后开始注册和接收循环"""
+        # DeviceThread 可能在对象创建与此处之间收到了停止请求。此时不能
+        # 将 stop() 设置的状态重新覆盖成运行中，避免快速“启动后立即停止”
+        # 仍然遗留一个 SIP 会话。
+        stop_event = getattr(self, "stop_event", None)
+        if self._stopping or (stop_event is not None and stop_event.is_set()):
+            self.log("[System] Start cancelled before SIP session was created.")
+            return
         # 绑定 UDP 端口（在 start 里做，不在构造函数里，避免多次 start/stop 时的端口残留问题）
         if not self._bind_socket():
             message = f"无法绑定本地UDP端口 {self.config.LOCAL_PORT}，请检查端口是否被其他程序占用"
             self.log(f"[错误] {message}")
             self._registration_fatal_error(message)
             return
+
+        # 端口绑定完成前也可能收到了停止命令。不要把 stop() 设定的
+        # _stopping 状态覆盖回 False，否则会出现“已停止又开始注册”的幽灵设备。
+        if self._stopping or (stop_event is not None and stop_event.is_set()):
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            self.log("[System] Start cancelled while preparing SIP socket.")
+            return
         
         self.running = True
-        self._stopping = False
+        if self._stopping or (stop_event is not None and stop_event.is_set()):
+            self.running = False
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            self.log("[System] Start cancelled before SIP registration.")
+            return
         self.log(f"[System] Starting Device {self.config.DEVICE_ID} on {self.config.LOCAL_IP}:{self.config.LOCAL_PORT}")
+        self.log(
+            f"[GB28181] 设备模拟协议: GB/T 28181-{getattr(self.config, 'GB28181_VERSION', '2016')} / "
+            f"视频编码: {getattr(self.config, 'VIDEO_CODEC', 'H264')} / "
+            f"音频编码: {getattr(self.config, 'AUDIO_CODEC', 'G711A') if getattr(self.config, 'audio_enabled', False) else '关闭'} / "
+            f"语音对讲: {getattr(self.config, 'TALK_CODEC', 'G711A') if getattr(self.config, 'talk_enabled', False) else '关闭'}"
+        )
         threading.Thread(target=self.receive_loop, daemon=True).start()
         threading.Thread(target=self.send_keepalive, daemon=True).start()
         self.register()
@@ -672,11 +890,13 @@ y={ssrc}
                 uri = f"sip:{self.config.SIP_SERVER_DOMAIN}@{self.config.SIP_SERVER_IP}:{self.config.SIP_SERVER_PORT}"
                 response = sip_stack.generate_auth_response(
                     self.config.DEVICE_ID, self.config.PASSWORD,
-                    self._auth_realm, self._auth_nonce, uri
+                    self._auth_realm, self._auth_nonce, uri,
+                    algorithm=self._auth_algorithm
                 )
                 auth_header = (
                     f'Digest username="{self.config.DEVICE_ID}", realm="{self._auth_realm}", '
-                    f'nonce="{self._auth_nonce}", uri="{uri}", response="{response}", algorithm=MD5'
+                    f'nonce="{self._auth_nonce}", uri="{uri}", response="{response}", '
+                    f'algorithm={self._auth_algorithm}'
                 )
             msg = sip_stack.build_register_msg(
                 self.config, self.cseq, self.call_id,
@@ -692,8 +912,10 @@ y={ssrc}
         self._retry_timer_deadline = None
         self.retry_count = 0
         self._set_registration_state("STOPPED", "设备已停止")
+        self.media_ctrl.stop_talk_session()
+        self._active_talk_callid = None
+        self._stop_all_stream_sessions()
         self.media_ctrl.stop_stream()
-        MediaController.kill_bundled_ffmpeg_processes(self.log)
         self._set_media_state("IDLE", "设备已停止，当前未推流")
         if self.sock:
             try:
